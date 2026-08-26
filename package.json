@@ -1,0 +1,32 @@
+{
+  "name": "driftguard",
+  "version": "0.1.0",
+  "description": "Watches a tracked npm dependency for breaking changes, summarizes them with an LLM, finds affected call sites, and drafts a fix.",
+  "main": "dist/index.js",
+  "scripts": {
+    "dev": "ts-node src/index.ts",
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "check:github": "ts-node src/github-check.ts"
+  },
+  "keywords": [
+    "npm",
+    "semver",
+    "breaking-changes",
+    "dependencies"
+  ],
+  "license": "MIT",
+  "private": true,
+  "dependencies": {
+    "@octokit/rest": "^22.0.1",
+    "axios": "^1.20.0",
+    "dotenv": "^17.4.2",
+    "semver": "^7.8.5"
+  },
+  "devDependencies": {
+    "@types/node": "^20.19.43",
+    "@types/semver": "^7.8.0",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.9.3"
+  }
+}

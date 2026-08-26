@@ -16,7 +16,7 @@ in `whatsapp-web.js` broke a production WhatsApp bot, and the fix had
 to be found and patched manually. DriftGuard is the tool that should
 have caught it first.
 
-## What it does (in progress — building in public, 7-day MVP)
+## What it does (in progress)
 
 - Tracks a dependency for new published versions
 - Pulls and summarizes the changelog/diff using an LLM

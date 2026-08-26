@@ -19,7 +19,9 @@ export const TRACKED_DEPENDENCIES: TrackedDependency[] = [
   {
     name: 'whatsapp-web.js',
     trackedVersion: '1.34.7',
-    repo: 'pedroslopez/whatsapp-web.js',
+    // The package moved from pedroslopez/whatsapp-web.js to the wwebjs org.
+    // GitHub still redirects the old path, but relying on a redirect is fragile.
+    repo: 'wwebjs/whatsapp-web.js',
     note:
       'Version Recepta runs in production (bridge + backend). Taken from the ' +
       'resolved entry in bridge/package-lock.json, not the "^1.34.7" range in ' +

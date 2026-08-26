@@ -6,6 +6,7 @@ import { compareVersions, VersionCompareError } from './compare';
 import { checkGitHubAuth, reportGitHubAuth } from './github-check';
 import { gatherChangeData, formatChangeData } from './gather-changes';
 import { summarizeChange, MissingApiKeyError, type VerdictResult } from './llm-client';
+import { findUsages, formatScanResult } from './scanner';
 
 /**
  * DriftGuard entry point.
@@ -28,6 +29,11 @@ interface CliOptions {
    *  LLM call costs tokens and is irrelevant when the drift check says nothing
    *  is behind, which is the common case. */
   summarize: boolean;
+  /** Pass `--scan` to run findUsages against the configured target repo when the
+   *  LLM verdict says `breaking=true`. Implies `--summarize`. */
+  scan: boolean;
+  /** Override the repo path the scanner should search. */
+  scanPath?: string;
 }
 
 function parseArgs(argv: string[]): CliOptions {
@@ -35,6 +41,7 @@ function parseArgs(argv: string[]): CliOptions {
     packageName: TRACKED_DEPENDENCIES[0]?.name ?? 'whatsapp-web.js',
     fullDiff: false,
     summarize: false,
+    scan: false,
   };
 
   for (let i = 0; i < argv.length; i++) {
@@ -53,6 +60,13 @@ function parseArgs(argv: string[]): CliOptions {
         break;
       case '--summarize':
         options.summarize = true;
+        break;
+      case '--scan':
+        options.scan = true;
+        options.summarize = true; // scan implies summarize — we need the verdict
+        break;
+      case '--scan-path':
+        options.scanPath = argv[++i];
         break;
       default:
         break;
@@ -99,6 +113,8 @@ async function reportChanges(
   newVersion: string,
   fullDiff: boolean,
   summarize: boolean,
+  scan: boolean,
+  scanPath?: string,
 ): Promise<void> {
   console.log('');
   console.log(`Gathering change data for ${packageName} ${oldVersion} → ${newVersion} ...`);
@@ -115,8 +131,10 @@ async function reportChanges(
 
     console.log('');
     console.log('Asking LLM for a structured verdict ...');
+    let verdict: VerdictResult | undefined;
     try {
-      const { verdict } = await summarizeChange(packageName, oldVersion, newVersion);
+      const result = await summarizeChange(packageName, oldVersion, newVersion);
+      verdict = result.verdict;
       reportVerdict(verdict);
     } catch (error) {
       if (error instanceof MissingApiKeyError) {
@@ -124,6 +142,25 @@ async function reportChanges(
         return;
       }
       console.log(`LLM summary failed unexpectedly: ${(error as Error).message}`);
+      return;
+    }
+
+    // Day 4: only scan when the verdict is unambiguously breaking. If the LLM
+    // says "safe" or returned a failure result, scanning the codebase for
+    // "removed" symbols would just produce noise.
+    if (scan && verdict && verdict.ok && verdict.verdict.breaking) {
+      const target = scanPath
+        ?? process.env.RECEPTA_TARGET_PATH
+        ?? '/mnt/c/Users/Vara/projects/business-brain/cohort-1-squad-siachen';
+
+      console.log('');
+      console.log(`Verdict says breaking — scanning ${target} for usages of affected symbols ...`);
+      try {
+        const scanResult = await findUsages(verdict.verdict.affectedMethods, target);
+        console.log(formatScanResult(scanResult));
+      } catch (error) {
+        console.log(`Scan failed: ${(error as Error).message}`);
+      }
     }
   }
 }
@@ -155,7 +192,7 @@ async function checkDependencies(
           );
         }
 
-        await reportChanges(dep.name, comparison.tracked, comparison.latest, fullDiff, summarize);
+        await reportChanges(dep.name, comparison.tracked, comparison.latest, fullDiff, summarize, false);
       }
     } catch (error) {
       failed += 1;
@@ -185,7 +222,15 @@ async function main(): Promise<void> {
       `Explicit comparison requested${tracked ? '' : ' (package not in config — checking anyway)'}.`,
     );
 
-    await reportChanges(options.packageName, options.from, options.to, options.fullDiff, options.summarize);
+    await reportChanges(
+  options.packageName,
+  options.from,
+  options.to,
+  options.fullDiff,
+  options.summarize,
+  options.scan,
+  options.scanPath,
+);
     process.exit(0);
   }
 

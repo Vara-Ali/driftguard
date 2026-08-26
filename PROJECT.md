@@ -39,6 +39,11 @@ npm run dev               # check tracked deps against the registry
 npm run check:github      # GitHub auth smoke test on its own
 npm run verify            # Day 3 LLM ground-truth validator against 1.34.6 -> 1.34.7
 
+# Day 4: full dogfood — change data, LLM verdict, then usage scan against Recepta.
+npm run dev -- --from 1.34.6 --to 1.34.7 --summarize --scan
+npm run dev -- --from 1.34.6 --to 1.34.7 --summarize --scan --scan-path /path/to/other/repo
+```
+
 # Force the change-gathering pipeline for a specific pair. Needed because the
 # tracked package is usually not behind, so the "update detected" branch never
 # fires against live data.
@@ -284,6 +289,14 @@ Tasks:
       `Verdict` interface in `src/llm-client.ts`. `affectedMethods` is an
       array of `{ name, reason }` so the model cannot cheat with a single
       string when it cannot find anything to name.
+
+**SCHEMA LOCK (Day 3 → Day 4+).** The `Verdict` interface is the canonical
+spec going forward; **Day 4 must consume `affectedMethods` as
+`{ name: string, reason: string }[]`, not `string[]`.** This is a deliberate
+improvement — a single string would have lost the model's reasoning about
+*why* something was affected, which the Day 4 scanner and Day 5 fix drafter
+both rely on. Changing the shape later would force a rebuild of every
+downstream consumer, so it is frozen here.
 - [x] Implement the LLM call using the existing provider setup from Recepta
       Same provider, same model (`MiniMax-M2.7-highspeed`), same OpenAI-
       compatible chat-completions endpoint at `api.minimax.io/v1/...` —
@@ -386,9 +399,138 @@ rather than re-prompting.
 Pre-flight findings (checked against the live GitHub API at the end of Day 1):
 
 ### Day 4 — Codebase Usage Scanner
-Status: NOT STARTED
-Goal: scan a target repo for real call sites of the affected methods and report
-file + line for each hit, with the false-positive rate low enough to trust.
+Status: COMPLETE
+Goal: given the Day 3 verdict's `{ name, reason }[]` array, scan a target
+repo and report every real call site of each removed/affected symbol —
+turning "the upgrade is breaking" into "this upgrade is breaking **for
+you, in these specific files**".
+
+The dogfood target for this build is the Recepta codebase (Recepta was
+chosen as the demo case precisely because it actually depended on
+whatsapp-web.js), so a real scan against Recepta proves whether the break
+in 1.34.6 → 1.34.7 would have been caught in advance.
+Tasks:
+- [x] Write `findUsages(affectedMethods, targetRepoPath)` that takes the
+      `{ name, reason }[]` array from Day 3 and searches a target codebase
+      for references to each method/symbol name
+      `src/scanner.ts`. Returns `{ targetPath, backend, scanned, usages,
+      anyHits }`; per-symbol `SymbolUsage` carries the LLM's reason, every
+      match, the match count, and which backend produced the results.
+- [x] Use a simple, reliable search first (ripgrep via child_process, or a
+      plain recursive file read + string/regex match) — do NOT build a full
+      AST parser today, that's overkill for an MVP and Day 2 already showed
+      formatting-sensitive parsing is fragile
+      Ripgrep-preferred via `execFileSync` with explicit path resolution,
+      manual walker fallback. Both produce the same `CodeMatch` shape so
+      downstream code does not care which ran. See "What did not go to plan"
+      below for why the ripgrep plumbing took three attempts.
+- [x] For each match, capture: file path, line number, and the actual line
+      of code containing the match
+      Captured as `CodeMatch { file, line, code }`. File paths are always
+      repo-relative in the output regardless of backend.
+- [x] Filter obvious noise: matches inside node_modules, .git, dist/, build
+      folders
+      ripgrep path uses `--glob '!**/{dir}/**'`, manual walker skips
+      directories outright. Covers `node_modules`, `.git`, `dist`, `build`,
+      `coverage`, `.next`, `.nuxt`, `.turbo`, `.cache`, `out`. Comment
+      stripping deliberately skipped — it would add complexity for marginal
+      value, since the per-symbol counts already let the reader see noise
+      versus real exposure.
+- [x] Handle common/generic symbol names — flag match counts per symbol so
+      the demo can see noise, don't silently drop them
+      Every symbol is reported even at zero matches. For non-zero counts,
+      the first 10 file:line hits are printed and the rest are summarized
+      as `... and N more match(es)`. The full count is never dropped.
+- [x] Run against a REAL target: the Recepta repo (a local checkout of
+      `cohort-1-squad-siachen/bridge` and `cohort-1-squad-siachen/backend`),
+      not a synthetic test repo
+      Default `RECEPTA_TARGET_PATH` in `.env.example` points at the real
+      checkout. Overridable per-run via the env var or `--scan-path`.
+- [x] Wire into index.ts: after the Day 3 LLM verdict prints, if
+      `breaking=true`, automatically run `findUsages` against the configured
+      target repo path and print every match found
+      New `--scan` flag (implies `--summarize` because we need the verdict
+      to know which symbols to search for). Only scans when the verdict
+      explicitly says `breaking=true` — scanning on a "safe" verdict or a
+      failed result would just be noise.
+
+**What was built.** One new module, one new CLI flag, and one new env var.
+`src/scanner.ts` (~200 lines) plus `findUsages()` and `formatScanResult()`.
+Wired through `reportChanges` in `index.ts` so `npm run dev -- --from X --to Y
+--summarize --scan` is a complete dogfood demo.
+
+**The real result on Recepta — no exposure.**
+Scanning Recepta for the 8 removed/whatsapp-web.js 1.34.7-affected symbols:
+
+| Symbol | Matches in Recepta |
+|---|---|
+| ClientSession | 0 |
+| LegacySessionAuth | 0 |
+| WABrowserId | 0 |
+| WASecretBundle | 0 |
+| WAToken1 | 0 |
+| WAToken2 | 0 |
+| restartOnAuthFail | 0 |
+| session | **227** — but every one is unrelated |
+
+Recepta has **zero real exposure** to the 1.34.7 session-auth removal. The
+227 `session` matches are all things like `sessionsRoot` config, the
+`/sessions/` directory on disk, `whatsapp-web.session-manager` log channel
+names, and `LocalAuth` (which is the *replacement* for the removed
+`LegacySessionAuth`). A grep for `\.session` as a property on a Client
+object returns nothing — so even when the LLM correctly flags `session`
+as a removed Client option, the codebase does not use it.
+
+That is the Day 4 finding, and it is a **legitimate story**: DriftGuard
+correctly identified a real, upstream breaking change, then correctly
+determined that *this particular consumer* is unaffected. That is the
+opposite of a false positive — it is a real negative, which is what you
+want a code-search tool to produce when there is genuinely nothing to
+find.
+
+**What did not go to plan.**
+1. **Ripgrep was not actually ripgrep.** Three attempts to call
+   `execFileSync('rg', ...)` failed silently on this WSL system. The shell
+   `which rg` returned a path, and `rg --version` printed `ripgrep 14.1.1`,
+   so the first attempt *looked* like it had worked. It had not: this
+   system's `rg` is a shell function that wraps the Claude CLI, masquerading
+   as ripgrep. The `14.1.1` line was Claude reporting back through its
+   shim. The actual ripgrep binary is not installed on this box. `which`
+   also failed when called from a child process, because subprocess PATH
+   inheritance does not see shell functions or aliases. Resolution:
+   explicitly look in `/usr/local/bin/rg`, `/usr/bin/rg`, `/home/vara/.local/bin/rg`,
+   etc. None of them exist on this box, so the scanner transparently falls
+   back to the manual walker. Backend label is honest about that — the
+   output reads `backend: manual-walker`, not a lie. Cost: a few hundred
+   files walked in JS instead of C; total scan time still under a second
+   on Recepta, so no practical impact.
+2. The first attempt also had a TS1128 on a JSDoc comment that contained
+   `'{**/}'` — the curly braces inside a backtick-string JSDoc were parsed
+   as template substitution. Rephrased without the pattern. Same class of
+   bug as the Day 3 `<boolean>` placeholders: prompts and comments read
+   like prose but they have to parse cleanly.
+
+**Known limitation, deliberately not fixed.** The scanner does no AST
+awareness. It matches the symbol name anywhere it appears — including in
+comments, strings, and unrelated variable names. Day 2's lesson was that
+formatting-sensitive parsing is fragile and not worth the dependency; that
+lesson applies here too. The per-symbol counts let a human spot that a
+`session` symbol returning 227 matches is noise rather than a real signal,
+which the verifier on Day 3 had to corroborate manually. A future
+heuristic — e.g. "strip `//`, `/* */`, and string-literal matches before
+counting" — would tighten this up but is not yet worth the engineering.
+
+**Worth noting for Day 7 demo.** The "real negative" finding (Recepta is
+not exposed) is as valuable as a "real positive" for the dogfood story:
+it shows the pipeline does not raise false alarms when a real consumer
+happens not to use a removed API. The Day 5 fix drafter's load is then
+zero in this case — nothing to migrate — and that itself is a feature.
+
+**Open question for Day 5–6.** The 1.34.6 → 1.34.7 story now has three
+outcomes stacked: breaking (Day 3 confirmed), but Recepta is unaffected
+(Day 4 confirmed). The 1.x → 2.0 upgrade flagged at the end of Day 1 may
+be the stronger demo for Day 7 — it would exercise the "real positive"
+path rather than the "real negative" path. Revisit when Day 5 lands.
 
 ### Day 5 — Fix Drafter
 Status: NOT STARTED

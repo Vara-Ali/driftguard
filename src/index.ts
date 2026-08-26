@@ -5,6 +5,7 @@ import { getLatestVersion, RegistryError } from './registry';
 import { compareVersions, VersionCompareError } from './compare';
 import { checkGitHubAuth, reportGitHubAuth } from './github-check';
 import { gatherChangeData, formatChangeData } from './gather-changes';
+import { summarizeChange, MissingApiKeyError, type VerdictResult } from './llm-client';
 
 /**
  * DriftGuard entry point.
@@ -23,12 +24,17 @@ interface CliOptions {
   to?: string;
   packageName: string;
   fullDiff: boolean;
+  /** Pass `--summarize` to also ask the LLM for a verdict. Off by default — the
+   *  LLM call costs tokens and is irrelevant when the drift check says nothing
+   *  is behind, which is the common case. */
+  summarize: boolean;
 }
 
 function parseArgs(argv: string[]): CliOptions {
   const options: CliOptions = {
     packageName: TRACKED_DEPENDENCIES[0]?.name ?? 'whatsapp-web.js',
     fullDiff: false,
+    summarize: false,
   };
 
   for (let i = 0; i < argv.length; i++) {
@@ -45,6 +51,9 @@ function parseArgs(argv: string[]): CliOptions {
       case '--full-diff':
         options.fullDiff = true;
         break;
+      case '--summarize':
+        options.summarize = true;
+        break;
       default:
         break;
     }
@@ -53,22 +62,75 @@ function parseArgs(argv: string[]): CliOptions {
   return options;
 }
 
+/** Render the LLM verdict as a four-line verdict block for the console. */
+function reportVerdict(result: VerdictResult): void {
+  if (!result.ok) {
+    console.log(`LLM VERDICT: NOT AVAILABLE — ${result.error}`);
+    return;
+  }
+
+  const v = result.verdict;
+  const tag = v.breaking ? `[BREAKING · ${v.confidence}]` : `[safe · ${v.confidence}]`;
+  console.log('');
+  console.log('LLM VERDICT');
+  console.log('-----------');
+  console.log(`  ${tag}`);
+  console.log(`  ${v.summary}`);
+  if (v.discrepancyNote) {
+    console.log('');
+    console.log('  discrepancy:');
+    console.log(`    ${v.discrepancyNote}`);
+  }
+  if (v.affectedMethods.length > 0) {
+    console.log('');
+    console.log('  affected:');
+    for (const m of v.affectedMethods) {
+      console.log(`    - ${m.name}: ${m.reason}`);
+    }
+  }
+  console.log('');
+  console.log(`  (latency ${result.latencyMs}ms, ${result.totalTokens} tokens, model ${result.model}${result.retried ? ', retried' : ''})`);
+}
+
 /** Fetch and print the change evidence for one upgrade. */
 async function reportChanges(
   packageName: string,
   oldVersion: string,
   newVersion: string,
   fullDiff: boolean,
+  summarize: boolean,
 ): Promise<void> {
   console.log('');
   console.log(`Gathering change data for ${packageName} ${oldVersion} → ${newVersion} ...`);
 
   const data = await gatherChangeData(packageName, oldVersion, newVersion);
   console.log(formatChangeData(data, { maxDiffLines: fullDiff ? 0 : 60 }));
+
+  if (summarize) {
+    if (!process.env.MINIMAX_API_KEY) {
+      console.log('');
+      console.log('Skipping LLM summary — MINIMAX_API_KEY is not set.');
+      return;
+    }
+
+    console.log('');
+    console.log('Asking LLM for a structured verdict ...');
+    try {
+      const { verdict } = await summarizeChange(packageName, oldVersion, newVersion);
+      reportVerdict(verdict);
+    } catch (error) {
+      if (error instanceof MissingApiKeyError) {
+        console.log(`Skipping LLM summary — ${error.message}`);
+        return;
+      }
+      console.log(`LLM summary failed unexpectedly: ${(error as Error).message}`);
+    }
+  }
 }
 
 async function checkDependencies(
   fullDiff: boolean,
+  summarize: boolean,
 ): Promise<{ checked: number; drifted: number; failed: number }> {
   let drifted = 0;
   let failed = 0;
@@ -93,7 +155,7 @@ async function checkDependencies(
           );
         }
 
-        await reportChanges(dep.name, comparison.tracked, comparison.latest, fullDiff);
+        await reportChanges(dep.name, comparison.tracked, comparison.latest, fullDiff, summarize);
       }
     } catch (error) {
       failed += 1;
@@ -123,7 +185,7 @@ async function main(): Promise<void> {
       `Explicit comparison requested${tracked ? '' : ' (package not in config — checking anyway)'}.`,
     );
 
-    await reportChanges(options.packageName, options.from, options.to, options.fullDiff);
+    await reportChanges(options.packageName, options.from, options.to, options.fullDiff, options.summarize);
     process.exit(0);
   }
 
@@ -133,7 +195,7 @@ async function main(): Promise<void> {
   }
 
   console.log('');
-  const { checked, drifted, failed } = await checkDependencies(options.fullDiff);
+  const { checked, drifted, failed } = await checkDependencies(options.fullDiff, options.summarize);
 
   console.log('');
   console.log(`Checked ${checked} dependenc${checked === 1 ? 'y' : 'ies'}: ${drifted} behind, ${failed} failed.`);

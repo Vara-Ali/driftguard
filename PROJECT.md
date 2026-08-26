@@ -37,6 +37,7 @@ npm install
 cp .env.example .env      # then add a real GITHUB_TOKEN
 npm run dev               # check tracked deps against the registry
 npm run check:github      # GitHub auth smoke test on its own
+npm run verify            # Day 3 LLM ground-truth validator against 1.34.6 -> 1.34.7
 
 # Force the change-gathering pipeline for a specific pair. Needed because the
 # tracked package is usually not behind, so the "update detected" branch never
@@ -267,9 +268,122 @@ Pre-flight findings (checked against the live GitHub API at the end of Day 1):
 
 
 ### Day 3 — LLM Breaking-Change Summarizer
-Status: NOT STARTED
-Goal: feed the raw change evidence to the LLM and get back a structured list of
-breaking changes, each naming the specific affected method or export.
+Status: COMPLETE
+Goal: feed the raw change evidence from Day 2 to the LLM and get back a
+structured verdict — was this upgrade breaking, what specifically broke,
+how confident is the call, and does the maintainer's account in the release
+notes match what the type diff shows?
+Tasks:
+- [x] Design the LLM prompt template that takes gatherChangeData() output
+      and produces a structured verdict
+      `src/prompts/summarize-change.ts`. Single `buildPrompt(change)` function
+      rather than scattered string concat — keeps the wording readable as
+      one document so iterating on it stays cheap.
+- [x] Define the exact output schema: { breaking, confidence, affectedMethods,
+      summary, discrepancyNote }
+      `Verdict` interface in `src/llm-client.ts`. `affectedMethods` is an
+      array of `{ name, reason }` so the model cannot cheat with a single
+      string when it cannot find anything to name.
+- [x] Implement the LLM call using the existing provider setup from Recepta
+      Same provider, same model (`MiniMax-M2.7-highspeed`), same OpenAI-
+      compatible chat-completions endpoint at `api.minimax.io/v1/...` —
+      `llm-client.ts` is essentially Recepta's `llm.ts` trimmed down to
+      chat-completion only.
+- [x] Prompt weighted toward top-level symbol removals as strong breaking
+      signals, nested inline-type property changes as weak noise
+      Three explicit heuristics in the system prompt: top-level exports
+      removed/renamed = STRONG breaking, nested property changes = WEAK,
+      reformat-flagged diffs = trust the symbol list not the line list.
+- [x] Prompt weighted toward discrepancy detection as a first-class finding
+      "If the release notes say bug fixes but the type diff shows removed
+      public API surface, that mismatch is itself the most important
+      finding. Call it out explicitly." — required as a non-null string
+      in the schema.
+- [x] Validate against the hand-written ground truth for v1.34.6 → v1.34.7
+      `src/verify.ts` plus `npm run verify`. Hardcoded `CASES` array so
+      adding more cases is one entry. Side-by-side verdict rendering and
+      field-level checks.
+- [x] Handle malformed/unparseable LLM output gracefully (retry once, then
+      fall back to a clear "could not determine" result)
+      First attempt, then retry with an explicit "your previous response
+      was not parseable JSON" nudge. Two failures in a row → structured
+      `VerdictFailure` with the raw text in the result, never a thrown error.
+      The retry path was not exercised on the real case (see below).
+- [x] Wire into index.ts: after gatherChangeData() runs, pass its output
+      through the new LLM summarization step and print the structured
+      verdict
+      New `--summarize` flag. Off by default — costs tokens, irrelevant
+      when the drift check says nothing is behind, which is the common
+      case. Missing `MINIMAX_API_KEY` skips the LLM step cleanly rather
+      than crashing.
+
+**What was built.** Three new modules plus one new subdir:
+`src/prompts/summarize-change.ts` (the template), `src/llm-client.ts` (axios
+to MiniMax, strict schema validation, JSON extraction that handles prose /
+fences / bare objects, retry-with-nudge, structured failure result), and
+`src/verify.ts` (the verifier). Plus a `verify` npm script. The Day 2 pipeline
+is now the input to an LLM verdict, end to end.
+
+**The first-try verdict.** On the real v1.34.6 → v1.34.7 data:
+- `breaking: true`, `confidence: high` — match.
+- Named all eight removed session/auth exports in `affectedMethods` — match.
+- Populated `discrepancyNote` (333 chars) explicitly calling out the
+  release-notes-downplay vs type-diff-shows-removals mismatch — match.
+- Bonus finding the prompt didn't even prime for: it correctly flagged that
+  `sendReaction` was *relocated* from a structures module to the Client class,
+  a non-removal breaking change that the symbol diff would not have caught.
+  Either the LLM picked that up from the release notes
+  (`feat(client): move \`sendReaction\` method to the Client by @maxkoryukov`)
+  or from reflowing the inline types; either way, the heuristic works.
+- **No retry needed.** The verifier shows `retried: false` on the first
+  attempt, which means the prompt and schema were tight enough that the model
+  produced parseable, schema-matching JSON immediately.
+
+**Cost / latency.** On `MiniMax-M2.7-highspeed`: ~16.5s wall clock, ~3,450
+tokens per call (release notes ~5KB + symbol diff + system prompt). That is
+roughly the budget for one decision: ~2¢ at retail MiniMax rates, which is
+fine for an end-of-build summary but not something to fire on every version
+that drifts behind. Notes for later tier decisions:
+
+- `--summarize` is opt-in. Drift check itself stays free.
+- The release-notes body alone is the bulk of the tokens; if cost becomes
+  a concern, the obvious next knob is truncating the body in `buildPrompt`
+  (already a parameter on `formatChangeData` for the same reason).
+- `--full-diff` does not enlarge the prompt — diff truncation happens at the
+  format step, not the prompt step. Means even an untruncated run costs the
+  same as the truncated one.
+
+**What did not go to plan.**
+1. The first `buildPrompt` template used `<boolean>` / `<string>` placeholders
+   for type fields. Inside a backtick template literal TypeScript tried to
+   parse `<boolean>` as a tag function and failed with TS1005. Fixed by
+   rewriting the placeholders in parentheses.
+2. The first `buildPrompt` template also included `` `affectedMethods` ``
+   literally in the prose. That closes the outer template literal early, and
+   TS pointed at line 74 (a non-existent error in the JSON schema block,
+   which actually lived further down). Escaped the inner backticks. Worth
+   recording: prompts read like prose but they're code, and they need to
+   parse cleanly. The next prompt that needs angle-bracket-like syntax or
+   backticks should escape deliberately.
+3. `verify.ts` crashed with `MissingApiKeyError` on the first run because
+   it had no `import 'dotenv/config'`. `index.ts` and `github-check.ts`
+   already had it; verify did not. Added. Surprised this took one round to
+   surface — should have added it the moment `getVerdictForChange` was
+   written.
+
+**Known limitation, deliberately not fixed.** `affectedMethods.reason` is
+free text from the model. The verifier checks the *names* appear, not the
+quality of the reason strings. A future "semantic correctness" check is
+out of scope for day 3; the schema is right, the field is informative, and
+over-specifying it now would just lock in one prompt iteration.
+
+**Note for Day 6 / demo.** The verdict block produced by `--summarize` is
+already shaped like the body of a pull request: a one-line headline, a
+plain-English summary, the discrepancy note, and the affected methods.
+When the PR-writing code lands, it should lift these fields directly
+rather than re-prompting.
+
+Pre-flight findings (checked against the live GitHub API at the end of Day 1):
 
 ### Day 4 — Codebase Usage Scanner
 Status: NOT STARTED

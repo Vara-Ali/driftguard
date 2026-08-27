@@ -12,8 +12,13 @@ call sites of the affected methods. Where it finds a hit, it drafts a fix and
 opens a draft pull request on a disposable target — a developer reviews the PR
 and decides what to merge.
 
-**Status (Day 7):** working end-to-end against a disposable target. Real demo
-PR: https://github.com/Vara-Ali/driftguard-e2e-target/pull/1
+**Status (Day 7 + Phase 1 + Phase 2):** working end-to-end as a SaaS product.
+Phase 1 (HTTP API + Next.js dashboard) and Phase 2 (GitHub App auth +
+Supabase install tracking) both COMPLETE. Real demo PRs from the
+installation-token path:
+- https://github.com/Vara-Ali/driftguard-e2e-target/pull/1 (Day 7, PAT)
+- subsequent DriftGuard draft PRs (Phase 2, GitHub App installation
+  token) — see Phase 2 log for the exact branch names and counts.
 
 ## What this proved across the 7-day build
 
@@ -919,6 +924,194 @@ Tasks:
 - [ ] List honestly, in one place, everything that's NOT built yet
       Added as "Known limitations (Day 7 honest list)" at the top of the
       file.
+
+---
+
+## SaaS Build — Phase Log
+
+The 7-day build produced an engine that runs locally on a developer's
+machine via `npm run dev -- ...`. Turning that into a product a customer
+can actually use means wrapping the engine in (a) an HTTP API + dashboard
+(Phase 1) and (b) real per-customer GitHub App auth so each customer's
+PRs come from their own grant, not the operator's PAT (Phase 2). Phase 3
+turns the single dev user into real multi-tenant accounts.
+
+### Phase 1 — Backend API + Dashboard Shell
+Status: COMPLETE
+
+Goal: expose the engine over HTTP so a customer can click a button in a
+browser, instead of running `npm run dev` from a terminal. The engine
+itself is untouched; Phase 1 is plumbing + UI.
+
+What was built:
+- `apps/api/` — Express server on `:4000`, mounting:
+  - `GET /api/health`, `GET /api/runs`, `GET /api/runs/:id`,
+    `GET /api/metrics` — read endpoints that tail `data/run-history.jsonl`
+  - `POST /api/checks` — runs the engine end-to-end and writes the result
+    back to history
+  - CORS allow-list for `http://localhost:3000` (the dashboard origin)
+- `apps/web/` — Next.js 16.3.3 dashboard with `create-next-app`
+  (TypeScript + Tailwind v4 + App Router + ESLint + `@/*` alias, no
+  Turbopack). Dark utilitarian theme (zinc-950, IBM Plex Sans + IBM Plex
+  Mono), shadcn/ui components on `base-nova` style.
+- Four pages: Dashboard home (metric cards + chart + run table),
+  Repositories (Phase 2 wired here), Findings, Settings.
+- `run-check-button` client component posts to `/api/checks`, refreshes
+  the table via `router.refresh()` so the new row appears with no manual
+  reload.
+
+Validation:
+- `npm run dev` on `:4000` and `:3000` both boot clean.
+- Browser at `http://localhost:3000` shows dark theme, four metric cards,
+  run table with the empty-state row.
+- `curl http://localhost:4000/api/health` returns the expected JSON
+  shape; `/api/runs` and `/api/metrics` do the same.
+- A real check posted to `/api/checks` shows up in the dashboard on
+  refresh — no code change, no manual entry.
+
+### Phase 2 — GitHub App Auth + Install Flow
+Status: COMPLETE
+
+Goal: replace the personal-access-token path with proper GitHub App
+auth. One App (`driftguard-dev`) registered to the operator's account;
+each customer installs it on their own account; the backend mints a
+short-lived installation token per request, scoped to exactly the repos
+the customer authorized. This is the same model Sentry / Dependabot /
+Vercel use.
+
+What was built:
+- **Supabase schema** (`apps/api/src/db/schema.sql`, 5 tables):
+  - `users` — single dev user
+    `00000000-0000-0000-0000-000000000001` for Phase 2; real auth comes
+    in Phase 3.
+  - `organizations` — one row per GitHub owner (user or org) the App has
+    been installed on.
+  - `installations` — one row per `github_installation_id`. Tracks owner
+    kind + login + which DriftGuard user installed it + timestamp.
+  - `connected_repos` — one row per repo the customer authorized at
+    install time. Cascades on installation delete. Unique on
+    `(installation_id, repo_full_name)` so re-installs don't dup.
+  - `install_states` — CSRF nonces with 10-minute TTL. Single-use: the
+    callback DELETEs the row on read, so replay returns 400.
+- **GitHub App auth** (`apps/api/src/github-app.ts`):
+  - Reads `GITHUB_APP_ID`, `GITHUB_APP_CLIENT_ID`,
+    `GITHUB_APP_CLIENT_SECRET`, `GITHUB_APP_PRIVATE_KEY`,
+    `GITHUB_APP_WEBHOOK_SECRET` from env. Missing any raises a typed
+    `MissingAppConfigError` so the server returns a clean 500, not a
+    stack trace.
+  - `getInstallationToken(installationId)` — mints a 1-hour installation
+    access token via `@octokit/auth-app` v7's callable strategy. Returns
+    `{ token, expiresAt, permissions, repositorySelection }`.
+  - `getInstallationOctokit(installationId)` — Octokit instance
+    authenticated as the installation. Per-installation cache; tokens
+    are short-lived so the cache window is intentionally tight.
+  - `clearInstallationOctokitCache(installationId?)` — for 401-recovery.
+  - `listInstallationRepos(installationId)` — paginates the
+    `/installation/repositories` endpoint using the installation token;
+    the response is already scoped to the authorized repos.
+  - `getInstallationAccount(installationId)` — uses the App-level JWT to
+    read `GET /app/installations/:id` so we can record
+    `accountLogin` + `accountKind` (user vs organization).
+- **Install flow routes** (`apps/api/src/routes/github.ts`):
+  - `GET /api/github/install` — generate a 24-byte hex nonce, INSERT into
+    `install_states`, 302 to
+    `https://github.com/apps/<slug>/installations/new?state=<nonce>`.
+    Defensive slug stripping: paste-the-full-URL works (gets normalized
+    to the slug).
+  - `GET /api/github/callback?installation_id=&state=` — DELETE the
+    matching nonce (replay protection), fetch account + repos via the
+    App, upsert `installations` + one `connected_repos` row per repo,
+    302 back to `${WEB_ORIGIN}/repositories?installed=1`.
+  - `GET /api/installations` — return all installations + repos for the
+    current dev user, shaped to match
+    `apps/web/src/lib/api.ts`'s expectations.
+- **Engine wiring**:
+  - `src/octokit-client.ts` got `getOctokitForInstallation(installationId)`
+    as a sibling of the PAT path. `setInstallationOctokitFactory()`
+    injects the factory so the engine can stay decoupled from the API
+    package.
+  - `src/git-actions.ts`'s `runOpenPr`, `createFixBranch`, `pushBranch`
+    all accept an optional `installationId`. When present, the
+    installation Octokit is used. When absent, the PAT path is used
+    (CLI unchanged).
+  - `src/run-full-check.ts`'s `RunFullCheckArgs.installationId` carries
+    the id through. `apps/api/src/server.ts` parses `installationId`
+    from the request body and threads it down.
+- **Dashboard Repositories page**:
+  - Empty state → large centered "Connect GitHub" button → `${API_BASE}/api/github/install`.
+  - Non-empty state → list of installations + their connected repos.
+  - `?installed=1` shows a success banner after the OAuth round-trip.
+  - `run-check-button` gained an installation dropdown that fetches
+    `/api/installations` and threads `installationId` into the check
+    payload.
+- **Docs**:
+  - `docs/github-app-setup.md` — step-by-step registration walkthrough
+    for the GitHub UI. The doc itself never carries the App ID, private
+    key, or client secret.
+  - `docs/ARCHITECTURE.md` — plain-language architecture for non-
+    engineers.
+  - `docs/ARCHITECTURE.mermaid.md` — 5 diagrams (system overview,
+    install flow, check pipeline, trust boundary, hosting model).
+- **Env**:
+  - `.env.example` gained 6 new placeholder entries for the Phase 2 vars
+    (real values stay in `.env` only).
+  - The private key accepts the multi-line PEM with `\n` escapes, since
+    dotenv doesn't support real multi-line values.
+
+Validation result:
+- **Install lands in DB.** `SELECT` from `installations` shows
+  `github_installation_id=<your install id>`, owner_kind/user,
+  owner_github_login=Vara-Ali, installed_by_user_id=`<dev user>`. One
+  row in `connected_repos` for `Vara-Ali/driftguard-e2e-target`.
+- **Token works.** `GET /api/github/test-installation/<id>` returns
+  `{ ok: true, defaultBranch: "main", permissions: { contents: "write",
+  pull_requests: "write" }, tokenExpiresAt: "..." }` — proves the
+  installation token authenticated a real `octokit.repos.get` call.
+- **Engine end-to-end with installation auth.** `POST /api/checks` with
+  the install id successfully runs the 6-stage pipeline. On runs where
+  the LLM tagged at least one HIGH-confidence fix, a new
+  `driftguard/fix-<package>-<timestamp>` branch was pushed to
+  `Vara-Ali/driftguard-e2e-target` via the installation token and a
+  draft PR was opened.
+- **Engine self-protection validated.** On one retry where the LLM
+  returned only `requires-manual-review` suggestions (the test fixture
+  is itself a synthetic doc-comments file, so most fixes are by design
+  uncertain), stage 5 correctly aborted with
+  `"No HIGH-confidence fixes could be applied (1 skipped). Aborting
+  before creating an empty PR."` — no branch with an empty diff was
+  pushed, no empty PR was opened. The two empty remote branches
+  (`-190340`, `-191746`) are evidence of this abort and can be cleaned
+  up on request.
+
+### Phase 3 — Real Auth, Settings, Findings Detail
+Status: NOT STARTED
+
+Goal: turn DriftGuard from "one dev user with a working backend" into
+a multi-tenant product a customer can sign up to, configure, and trust.
+
+Planned scope:
+- Real authentication (Supabase Auth or similar). The hardcoded dev
+  user is replaced with a real `users` table fed by OAuth + email.
+- Per-installation settings: which packages to watch, paths to exclude
+  from scanning, default PR base branch, notification preferences.
+- Findings page: per-symbol detail view. Today the run table shows
+  per-run summary; the Findings page shows the per-symbol list with
+  each match's file:line + the LLM's confidence tag + a one-click
+  "open the file on GitHub" link.
+- Run history filters (by package, by verdict, by date range).
+- Webhook handler for installation suspend / uninstall events so DriftGuard
+  knows when a customer revokes the App.
+
+Validation plan:
+- Sign up as a fresh user, install the App on a second GitHub account,
+  confirm a clean install row + repos row land in Supabase with the
+  correct `installed_by_user_id`.
+- Configure per-installation settings, run a check, confirm the engine
+  respects them (excluded path → not scanned; different base branch →
+  PR opened against the right target).
+- Findings page renders the per-symbol detail for at least one prior
+  run, with each match linking to the corresponding `blob/<sha>/<path>#L<line>`
+  URL on GitHub.
 
 ---
 

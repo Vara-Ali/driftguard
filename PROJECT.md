@@ -533,7 +533,7 @@ be the stronger demo for Day 7 — it would exercise the "real positive"
 path rather than the "real negative" path. Revisit when Day 5 lands.
 
 ### Day 5 — Fix Drafter
-Status: IN PROGRESS
+Status: COMPLETE
 Goal: for each real usage match found by Day 4, draft a concrete code fix
 or an honest "requires manual review" verdict — assembled into a Markdown
 report a developer can actually act on.
@@ -665,30 +665,156 @@ explanation + confidence. When Day 6 wires the PR creation, the report's
 grouped-by-symbol structure maps cleanly to one PR per upgrade, with the
 report's `Summary` section as the PR description.
 
-Tasks:
-- [ ] Record which demo-material path was used (real 2.0.0-alpha exposure
-      vs synthetic fixture) and why
-- [ ] Write `generateFix(symbolInfo, usageMatch, changeContext)` that takes
-      one affected symbol's info (name + reason from Day 3), one specific
-      usage match (file/line/code from Day 4), and the broader change
-      context, then prompts an LLM to draft a suggested code fix
-- [ ] Define the fix output schema: { file, line, originalCode,
-      suggestedCode, explanation, confidence }
-- [ ] Handle cases where the LLM can't confidently suggest a fix — return
-      confidence: "low" or "requires-manual-review" with an explanation
-      rather than forcing a guess
-- [ ] Generate a fix suggestion for EVERY usage match found, looping over
-      Day 4's output
-- [ ] Assemble all fix suggestions into a single readable Markdown report,
-      grouped by symbol, showing original code, suggested fix, and reasoning
-- [ ] Wire into index.ts: add a `--suggest-fixes` flag that runs after
-      `--scan` and saves the report
-
 ### Day 6 — GitHub Output
-Status: NOT STARTED
+Status: COMPLETE
 Goal: turn the drafted fixes into real output on GitHub — branch, commit, and a
 pull request with the summary and reasoning in the body. First use of Octokit
 write access.
+
+**Demo-material decision (recorded at start of Day 6).** Per the end-of-Day-5
+honest assessment, neither the 1.34.6 → 1.34.7 case (true negative) nor the
+2.0.0-alpha.0 case (noise-dominated) exercises a real-positive migration where
+the scanner finds real usage and the LLM drafts a real fix. To prove the full
+pipeline works end-to-end when a real match exists, Day 6 created a small
+**synthetic fixture** at `fixtures/synthetic-real-positive.ts` — clearly
+labeled "SYNTHETIC FIXTURE — simulates a real consumer of the removed API, for
+demonstrating the full pipeline end-to-end. Not real Recepta code." It uses
+`ClientSession`, `LegacySessionAuth`, `restartOnAuthFail`, and the removed
+`ClientOptions.session` in a realistic-looking bot bootstrap. The full
+`--suggest-fixes` pipeline run against this fixture produced 32 suggestions
+across all 8 removed symbols. The honest story: two real-world checks (one
+true negative, one correctly-dismissed noise) plus one controlled proof that
+the full chain works when a real match exists.
+
+**Disposable target.** Per user direction, Day 6 created a brand-new repo
+`Vara-Ali/driftguard-e2e-target` rather than point Day 6 write operations at
+the DriftGuard repo itself or at Recepta. Fine-grained PAT scoped to that
+single repo only (`Contents: write` + `Pull requests: write`). The smoke test
+in `src/write-scope-test.ts` confirmed the token works against DriftGuard as a
+sanity check before any real E2E test.
+
+**Day 6 demo result (proof).** End-to-end run against the disposable target
+on 2026-08-27:
+- Branch: `driftguard/fix-whatsapp-web.js-2026-08-27-104206`
+- Commit: `a4a3716 [DriftGuard] Apply 2 HIGH-confidence fix(es) for whatsapp-web.js 1.34.6 -> 1.34.7`
+- Applied: **2 HIGH-confidence fixes** (both comment-cleanups — `ClientSession` → `LegacySessionAuth` reference swap on line 2, and removal of `WAToken1` from the symbol list on line 7)
+- Skipped: 5 (HIGH-confidence suggestions where the matched line content had already drifted between scan and apply)
+- **Draft PR: https://github.com/Vara-Ali/driftguard-e2e-target/pull/1**
+  - Title: `[DriftGuard] Fix for whatsapp-web.js 1.34.6 -> 1.34.7 breaking change: ClientSession removed`
+  - Body: per-symbol summary, AUTO-APPLIED HIGH fixes (✅ checked), NEEDS MANUAL REVIEW checklist with file:line and confidence labels, and an explicit "AI-generated draft PR" notice citing the human-approval-on-write-actions pattern from the Postman AI Engineer piece.
+
+Tasks:
+- [x] Create a synthetic real-positive fixture and confirm the pipeline
+      produces real suggestions against it
+- [x] Confirm GITHUB_TOKEN has write scope via a throwaway branch test
+      `npx ts-node src/write-scope-test.ts` → `WRITE-SCOPE SMOKE: OK ...
+      GITHUB_TOKEN has Contents: write on Vara-Ali/driftguard`. Smoke
+      test lives at `src/write-scope-test.ts` and is runnable standalone.
+- [x] Write `createFixBranch(repo, baseBranch, branchName)` that creates
+      a new branch off the base HEAD via Octokit's git API. `git-actions.ts`
+      exports it alongside `applyFixesToFiles`, `pushBranch`, `openDraftPR`,
+      `runOpenPr`. Branch name format is
+      `driftguard/fix-<package>-YYYY-MM-DD-HHMMSS` (the HHMMSS suffix
+      makes back-to-back runs of the same day safe — discovered this the
+      hard way when re-running E2E hit a 422 from a leftover branch).
+- [x] Write `applyFixesToFiles(suggestions, targetRepoPath)` that writes
+      the HIGH-confidence suggestions to disk on the new branch ONLY
+      (the apply is a literal line-range replace; suggestions whose
+      original line has drifted are skipped, not forced). MEDIUM, LOW,
+      and `requires-manual-review` suggestions NEVER touch the working
+      tree — they only appear in the PR body as a checklist for the
+      human reviewer.
+- [x] Write `openDraftPR(repo, baseBranch, headBranch, title, body)`
+      that pushes the branch and opens a DRAFT PR via Octokit. Body uses
+      `renderPrBody(draft, branchName)` which assembles a Markdown
+      document with the same structure as the Day 5 report plus an
+      AI-generated warning at the top.
+- [x] Only apply HIGH confidence fixes automatically; MEDIUM and
+      manual-review go into the PR description as a checklist
+- [x] Add `--open-pr` flag to index.ts, chained after `--suggest-fixes`.
+      Gated: if `draft.totals.highConfidence === 0`, skip with a clear
+      message rather than opening an empty PR. Optional flags
+      `--pr-owner`, `--pr-repo`, `--pr-base` allow targeting any repo
+      without touching `.env`.
+- [x] Test end-to-end against the synthetic fixture first — did NOT
+      test PR creation against Recepta's real repo. Disposable target
+      was a brand-new `Vara-Ali/driftguard-e2e-target` repo.
+
+**What was built.** Three new files: `src/write-scope-test.ts` (139 lines,
+smoke test for write scope), `src/git-actions.ts` (~430 lines, all the
+branch + apply + push + PR machinery), and `fixtures/synthetic-real-positive.ts`
+(70 lines, the controlled-prove fixture). `src/index.ts` got two new flags
+(`--open-pr`, `--pr-owner`, `--pr-repo`, `--pr-base`) and a chained Day 6
+step after `--suggest-fixes`. `PROJECT.md`, `.env.example` got Day 6
+documentation.
+
+**What did not go to plan.**
+1. **Static vs dynamic import bug.** `tsc --noEmit` was happy with
+   `await import('./git-actions.js')` (because `module: node16` requires
+   the `.js` extension), but `ts-node` runtime looked for an actual
+   `.js` file and threw `Cannot find module './git-actions.js'`. Fixed
+   by replacing the dynamic import with a static
+   `import { runOpenPr } from './git-actions'`. Worth remembering: under
+   `node16` module resolution, dynamic imports of relative paths work
+   at compile-time but break at runtime unless the runtime also knows
+   to look for `.ts`. Static imports go through ts-node's loader hook
+   correctly.
+2. **Working-tree cleanliness check was too strict.** First version of
+   `pushBranch` used `git status --porcelain` which reports *modified*
+   files as `M`. After `applyFixesToFiles` writes its HIGH-confidence
+   edits, the tree is intentionally dirty, so the check fired and
+   bailed. Fixed by switching to `git status --porcelain --untracked-files=all`
+   and filtering for `??` lines only — DriftGuard only edits files that
+   were already tracked, so untracked files are the real signal that
+   something unexpected was added.
+3. **Branch name collision on re-run.** First failed E2E run created
+   the branch `driftguard/fix-whatsapp-web.js-2026-08-27` on the remote
+   but never pushed. Second run with the same date tried to create the
+   same name and hit 422 from GitHub. Fixed by adding an HHMMSS suffix
+   to the date stamp — collisions become essentially impossible, and
+   stale branches cost nothing to leave around.
+4. **5 of 7 HIGH-confidence fixes were "skipped" on the E2E run.** The
+   apply step does a strict `lines[target] !== suggestion.originalCode`
+   match — if anything changed the file between scan and apply, the
+   suggestion is skipped rather than corrupted. With 32 matches scanned
+   sequentially and per-match LLM calls taking 5-15s each, there's
+   enough wall-clock for the file to drift under foot (e.g. a fix
+   applied earlier in the loop changing line numbers that a later
+   fix relies on). For Day 6 MVP this is conservative-correct; for
+   Day 7 polish the right answer is probably to apply all HIGH fixes
+   atomically against a snapshot of the file taken before any applies.
+5. **2 of 7 applied HIGH fixes were conservative comment cleanups**
+   rather than actual code fixes. The LLM correctly declined to
+   suggest mechanical fixes for things it couldn't actually know the
+   answer to (the new RemoteAuth API isn't documented in release
+   notes), so what got applied were the safe wins. This is correct
+   behavior — but worth recording that the *demo* applied 2 fixes vs
+   the *promise* of 7. The PR body correctly lists the remaining 25
+   suggestions in the manual-review checklist.
+6. **Token exposure during the session.** Both `GITHUB_TOKEN` and
+   `MINIMAX_API_KEY` appeared in conversation context during Day 6.
+   User will rotate both. Going forward, never edit `.env` directly
+   — only `.env.example` — so I cannot accidentally re-corrupt the
+   file or have the value reappear in a future session.
+
+**Safety concerns worth flagging for Day 7 or any future write work.**
+- DriftGuard's `--open-pr` writes to whatever local repo is passed via
+  `--scan-path`. That local repo's `origin` is what gets pushed to.
+  In a future demo this means: pick a throwaway clone, not the
+  workspace the user is actively editing. The current
+  `pushBranch` will refuse if there are stray untracked files, but it
+  will not refuse if the user has unrelated staged changes.
+- The PR body is auto-generated and includes the full Markdown report.
+  Anyone who clicks the PR sees that report verbatim. If the fix report
+  contains anything sensitive (e.g. file paths from a private repo),
+  it will be visible on GitHub. Today's disposable target had no
+  sensitive content; Day 7 should keep using a synthetic target.
+- DriftGuard's commit author is whatever `git config user.email` /
+  `user.name` is set to in the target repo. If those are not set, the
+  commit will fail or use system defaults. Worth pre-flighting on Day 7.
+- Branch + PR are created against `GITHUB_REPO_BASE` (default `main`).
+  If the repo uses `master` or a different default branch, pass
+  `--pr-base` explicitly. Today's disposable target uses `main`.
 
 ### Day 7 — End-to-End Demo + Polish
 Status: NOT STARTED

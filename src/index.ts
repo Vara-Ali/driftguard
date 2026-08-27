@@ -9,6 +9,7 @@ import { summarizeChange, MissingApiKeyError, type VerdictResult } from './llm-c
 import { findUsages, formatScanResult } from './scanner';
 import { draftFixesForChange } from './fix-generator';
 import { saveReport, announceReport } from './report';
+import { runOpenPr } from './git-actions';
 
 /**
  * DriftGuard entry point.
@@ -39,6 +40,16 @@ interface CliOptions {
   /** Pass `--suggest-fixes` to chain Day 5's per-match fix drafter after
    *  `--scan`. Implies `--scan` (and therefore `--summarize`). */
   suggestFixes: boolean;
+  /** Pass `--open-pr` to chain Day 6's GitHub PR creation after
+   *  `--suggest-fixes`. Implies `--suggest-fixes`. Gated to require at
+   *  least one HIGH-confidence fix before it will run. */
+  openPr: boolean;
+  /** Override the GitHub repo for PR creation. Defaults to owner from
+   *  GITHUB_REPO_OWNER env var, falling back to 'Vara-Ali' / 'driftguard'. */
+  prOwner?: string;
+  prRepo?: string;
+  /** Override the base branch for the PR. Defaults to 'main'. */
+  prBaseBranch?: string;
 }
 
 function parseArgs(argv: string[]): CliOptions {
@@ -48,6 +59,7 @@ function parseArgs(argv: string[]): CliOptions {
     summarize: false,
     scan: false,
     suggestFixes: false,
+    openPr: false,
   };
 
   for (let i = 0; i < argv.length; i++) {
@@ -78,6 +90,19 @@ function parseArgs(argv: string[]): CliOptions {
         options.suggestFixes = true;
         options.scan = true;
         options.summarize = true;
+        break;
+      case '--open-pr':
+        options.openPr = true;
+        options.suggestFixes = true;
+        break;
+      case '--pr-owner':
+        options.prOwner = argv[++i];
+        break;
+      case '--pr-repo':
+        options.prRepo = argv[++i];
+        break;
+      case '--pr-base':
+        options.prBaseBranch = argv[++i];
         break;
       default:
         break;
@@ -127,6 +152,10 @@ async function reportChanges(
   scan: boolean,
   scanPath?: string,
   suggestFixes = false,
+  openPr = false,
+  prOwner?: string,
+  prRepo?: string,
+  prBaseBranch?: string,
 ): Promise<void> {
   console.log('');
   console.log(`Gathering change data for ${packageName} ${oldVersion} → ${newVersion} ...`);
@@ -183,6 +212,52 @@ async function reportChanges(
           const savedPath = saveReport(draft);
           for (const line of announceReport(draft, savedPath)) {
             console.log(line);
+          }
+
+          // Day 6: chain the GitHub PR creation when --open-pr is set.
+          // Gated to require at least one HIGH-confidence fix so we never
+          // open an empty PR by accident.
+          if (openPr) {
+            if (draft.totals.highConfidence === 0) {
+              console.log('');
+              console.log('Skipping --open-pr: zero HIGH-confidence fixes would be applied.');
+              console.log('  (MEDIUM / LOW / manual-review suggestions go into a PR as a checklist,');
+              console.log('   not as auto-applied diffs. Run without --open-pr to just see the report.)');
+            } else {
+              console.log('');
+              console.log('Opening draft PR on GitHub ...');
+              console.log(`  → creating branch on ${prRepo ?? process.env.GITHUB_REPO_NAME ?? 'driftguard'} ...`);
+              try {
+                const result = await runOpenPr({
+                  draft,
+                  repo: {
+                    owner: prOwner ?? process.env.GITHUB_REPO_OWNER ?? 'Vara-Ali',
+                    name: prRepo ?? process.env.GITHUB_REPO_NAME ?? 'driftguard',
+                  },
+                  baseBranch: prBaseBranch ?? process.env.GITHUB_REPO_BASE ?? 'main',
+                  targetRepoPath: target,
+                });
+
+                if (result.ok) {
+                  console.log('  → PR opened.');
+                  console.log('');
+                  console.log('DRAFT PR OPENED');
+                  console.log('---------------');
+                  console.log(`  applied : ${result.applied} HIGH-confidence fix(es)`);
+                  console.log(`  skipped : ${result.skipped}`);
+                  console.log(`  url     : ${result.prUrl}`);
+                } else {
+                  console.log('');
+                  console.log(`Draft PR failed: ${result.error}`);
+                  console.log('  → Branch may have been created. Inspect the repo before retrying.');
+                }
+              } catch (error) {
+                console.log(`Draft PR threw unexpectedly: ${(error as Error).message}`);
+                if ((error as Error).stack) {
+                  console.log((error as Error).stack);
+                }
+              }
+            }
           }
         } catch (error) {
           if (error instanceof MissingApiKeyError) {
@@ -262,6 +337,10 @@ async function main(): Promise<void> {
   options.scan,
   options.scanPath,
   options.suggestFixes,
+  options.openPr,
+  options.prOwner,
+  options.prRepo,
+  options.prBaseBranch,
 );
     process.exit(0);
   }

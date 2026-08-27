@@ -8,5 +8,9 @@ dist/
 *.log
 npm-debug.log*
 
+# Day 5 generated fix reports. The most recent one is what you want to read,
+# not whatever happened to be checked in.
+reports/
+
 .DS_Store
 Thumbs.db

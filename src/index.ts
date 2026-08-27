@@ -7,6 +7,8 @@ import { checkGitHubAuth, reportGitHubAuth } from './github-check';
 import { gatherChangeData, formatChangeData } from './gather-changes';
 import { summarizeChange, MissingApiKeyError, type VerdictResult } from './llm-client';
 import { findUsages, formatScanResult } from './scanner';
+import { draftFixesForChange } from './fix-generator';
+import { saveReport, announceReport } from './report';
 
 /**
  * DriftGuard entry point.
@@ -34,6 +36,9 @@ interface CliOptions {
   scan: boolean;
   /** Override the repo path the scanner should search. */
   scanPath?: string;
+  /** Pass `--suggest-fixes` to chain Day 5's per-match fix drafter after
+   *  `--scan`. Implies `--scan` (and therefore `--summarize`). */
+  suggestFixes: boolean;
 }
 
 function parseArgs(argv: string[]): CliOptions {
@@ -42,6 +47,7 @@ function parseArgs(argv: string[]): CliOptions {
     fullDiff: false,
     summarize: false,
     scan: false,
+    suggestFixes: false,
   };
 
   for (let i = 0; i < argv.length; i++) {
@@ -67,6 +73,11 @@ function parseArgs(argv: string[]): CliOptions {
         break;
       case '--scan-path':
         options.scanPath = argv[++i];
+        break;
+      case '--suggest-fixes':
+        options.suggestFixes = true;
+        options.scan = true;
+        options.summarize = true;
         break;
       default:
         break;
@@ -115,6 +126,7 @@ async function reportChanges(
   summarize: boolean,
   scan: boolean,
   scanPath?: string,
+  suggestFixes = false,
 ): Promise<void> {
   console.log('');
   console.log(`Gathering change data for ${packageName} ${oldVersion} → ${newVersion} ...`);
@@ -160,6 +172,25 @@ async function reportChanges(
         console.log(formatScanResult(scanResult));
       } catch (error) {
         console.log(`Scan failed: ${(error as Error).message}`);
+      }
+
+      // Day 5: chain the per-match fix drafter when --suggest-fixes is set.
+      if (suggestFixes) {
+        console.log('');
+        console.log('Generating per-usage fix suggestions ...');
+        try {
+          const draft = await draftFixesForChange(packageName, oldVersion, newVersion, target);
+          const savedPath = saveReport(draft);
+          for (const line of announceReport(draft, savedPath)) {
+            console.log(line);
+          }
+        } catch (error) {
+          if (error instanceof MissingApiKeyError) {
+            console.log(`Skipping fix draft — ${error.message}`);
+          } else {
+            console.log(`Fix draft failed: ${(error as Error).message}`);
+          }
+        }
       }
     }
   }
@@ -230,6 +261,7 @@ async function main(): Promise<void> {
   options.summarize,
   options.scan,
   options.scanPath,
+  options.suggestFixes,
 );
     process.exit(0);
   }

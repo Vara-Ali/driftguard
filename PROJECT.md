@@ -533,9 +533,156 @@ be the stronger demo for Day 7 — it would exercise the "real positive"
 path rather than the "real negative" path. Revisit when Day 5 lands.
 
 ### Day 5 — Fix Drafter
-Status: NOT STARTED
-Goal: for each confirmed call site, draft a concrete code change that migrates
-it to the new API, with the old and new code shown side by side.
+Status: IN PROGRESS
+Goal: for each real usage match found by Day 4, draft a concrete code fix
+or an honest "requires manual review" verdict — assembled into a Markdown
+report a developer can actually act on.
+
+**Demo-material decision (recorded at start of Day 5).** The 1.x → 2.0
+upgrade flagged at the end of Day 1 was investigated as a candidate
+alternative demo case. Pre-flight findings:
+- The npm registry has `2.0.0-alpha.0` published and unpkg serves its
+  `.d.ts`, so the type-diff side of the pipeline runs unchanged.
+- The GitHub tag `v2.0.0-alpha.0` exists (sha `cca33aa0...`) but **no GitHub
+  Release** was published against it. `changelog.ts` returns
+  `found: false, reason: 'No GitHub Release exists for ...'` and the LLM
+  works from the type diff and npm metadata alone.
+- The type diff between 1.34.7 and 2.0.0-alpha.0 is genuinely massive:
+  170 symbols removed, 1145 lines deleted in `index.d.ts` alone. The whole
+  Channel / Poll / ScheduledEvent / Broadcast surface is gone, plus a long
+  list of options types and helpers.
+- Day 4 scan against Recepta finds **14 matches across 13 symbols**,
+  including real consumer code plus a heavy bundle of matches in
+  `frontend/.output/public/assets/` that are minified production output
+  rather than source — excluded by adding `.output` to NOISE_DIRS.
+
+This gives us a real-positive demo (the opposite of the Day 4 real-negative)
+with enough exposure to actually exercise Day 5's per-match fix generation.
+**Decision: use the real 2.0.0-alpha.0 path. Synthetic fixture not needed.**
+Tasks:
+- [x] Record which demo-material path was used (real 2.0.0-alpha exposure
+      vs synthetic fixture) and why
+- [x] Write `generateFix(symbolInfo, usageMatch, changeContext)` that takes
+      one affected symbol's info (name + reason from Day 3), one specific
+      usage match (file/line/code from Day 4), and the broader change
+      context, then prompts an LLM to draft a suggested code fix
+      `src/fix-generator.ts`. `draftOneFix()` issues one LLM call per match
+      with retry-once-on-bad-JSON semantics, mirroring the Day 3 verdict path.
+- [x] Define the fix output schema: { file, line, originalCode,
+      suggestedCode, explanation, confidence }
+      `FixSuggestion` interface. `confidence` deliberately adds
+      `'requires-manual-review'` to the Day 3 set so the LLM can flag a
+      call site as "this needs a human" without faking a fix.
+- [x] Handle cases where the LLM can't confidently suggest a fix
+      System prompt instructs the model to set `confidence:
+      'requires-manual-review'` with a real explanation rather than guess.
+      When the call itself fails or JSON cannot be parsed, the suggestion
+      is emitted as `requires-manual-review` with an error string, never
+      silently dropped.
+- [x] Generate a fix suggestion for EVERY usage match found, looping over
+      Day 4's output
+      Sequential per-match. One LLM call per match is the right shape for
+      an MVP — easier to reason about, easier to debug, easier to back
+      off per call on rate-limit pressure. Cost is real: 13 matches ≈
+      ~6,500 prompt tokens + ~6,500 completion tokens at MiniMax rates.
+- [x] Assemble all fix suggestions into a single readable Markdown report,
+      grouped by symbol, showing original code, suggested fix, and reasoning
+      `src/report.ts`. One file per run under `reports/`,
+      timestamped and named after the package + version pair.
+- [x] Wire into index.ts: add a `--suggest-fixes` flag that runs after
+      `--scan` and saves the report
+      New flag implies `--scan` and `--summarize`. On the day 5 demo run,
+      `npm run dev -- --from 1.34.7 --to 2.0.0-alpha.0 --summarize --scan
+      --suggest-fixes` produces the full report.
+
+**What was built.** Three new modules: `src/prompts/generate-fix.ts`
+(single-match fix prompt template), `src/fix-generator.ts` (per-match
+LLM call + retry + sanitization), and `src/report.ts` (Markdown renderer
++ file save). One refactor: extracted `callOnce` to `src/llm-client-internal.ts`
+so both the Day 3 summarizer and the Day 5 drafter share the same HTTP
+wrapper — duplicated chat-completion logic across two files would have
+been a maintenance trap. One new CLI flag: `--suggest-fixes`. One new
+output directory: `reports/` (gitignored).
+
+**The real result on Recepta, honestly read.** The fix report contains
+13 suggestions for the 2.0.0-alpha.0 upgrade. Distribution:
+7 high-confidence, 3 medium-confidence, 3 manual-review, 0 generation
+errors. **However, every one of the 13 matches was a false positive** in
+the same sense as the Day 4 `session` noise — `Poll` matched English
+prose ("Polls every 30s"), and `businessHours` matched nothing in the
+repo. The model correctly identified that the *matching line* was not
+actually a removed-API usage in most cases and recommended either
+rewording the comment or flagging for manual review. The Day 5
+machinery works; the Day 4 scanner's noise still dominates.
+
+That is honest Day 5 data: the fix-drafting pipeline (read context,
+prompt LLM, parse JSON, render Markdown) functions correctly. The fact
+that the underlying scanner surfaced noise is a Day 4 problem, not a Day 5
+problem. With a real-positive day 4 result (which the `2.0.0-alpha.0`
+promised but did not actually deliver for Recepta), Day 5 would have
+produced useful real fixes.
+
+**What did not go to plan.**
+1. **2.0.0-alpha.0 had no real Recepta exposure after all.** Pre-flight
+   noted "14 matches across 13 symbols" — those were nearly all in
+   `frontend/.output/public/assets/` (minified production bundles) and
+   `Poll` matched English prose in comments rather than actual API uses.
+   Once `.output` was excluded, only 2 real symbols (`Poll`, `businessHours`)
+   produced matches. The honest takeaway: *the demo path that looked
+   promising on Day 2 turned out to be weak once noise was filtered out.*
+   For Day 7 we will either need a synthetic fixture or a different
+   real upgrade that surfaces genuine code exposure.
+2. **LLM verdict occasionally returned prose strings instead of symbol
+   names** in `affectedMethods[].name` — e.g. `"puppeteer (and related
+   options)"` and `"[170 total removed symbols]"`. The strict schema
+   check accepted them because the type is just `string`. Fixed two ways:
+   added a sanitization pass in `fix-generator.ts` that drops any `name`
+   that does not match `/^[A-Za-z_$][\w$]*$/`, and updated the Day 3
+   prompt to explicitly forbid prose in the field. The sanitization is
+   the load-bearing fix — it makes the verifier stricter without making
+   the LLM fail on an unhelpful edge case.
+3. **`MiniMax-M2.7-highspeed` emits a `<think>...</think>` reasoning
+   block before its answer** on harder calls, breaking JSON extraction.
+   Six calls in a row failed with `Unexpected token '<', "<think>\nLo"...`
+   before the bug was diagnosed. Fixed by stripping the leading reasoning
+   block before the JSON parse — applied in both the Day 3 `extractJson`
+   and the Day 5 `tryParseJson`. **This is a Day 7 cost observation:**
+   ~10% of completion tokens are reasoning, not the answer.
+4. **`npm run dev -- --from X --to Y` parses the version pair via a
+   generic `[++i]` flag loop in `parseArgs`, which silently swallows
+   unknown flags.** If a user types `--from X` without `--to`, the loop
+   consumes `X` as the value of `--from`, then exits early. Pre-existing from
+   Day 4, still works.
+6. A duplicate declaration of `ChatCompletionResponse` survived an earlier
+   refactor of `llm-client.ts` (the interface was added three times during
+   iterative edits). Removed. Worth recording as a caution: when editing
+   a file repeatedly across turns, grep before assuming a refactor is
+   final.
+
+**Worth noting for Day 7.** The Markdown report's format is already
+pull-request-body-shaped: one block per match, with original + suggested +
+explanation + confidence. When Day 6 wires the PR creation, the report's
+grouped-by-symbol structure maps cleanly to one PR per upgrade, with the
+report's `Summary` section as the PR description.
+
+Tasks:
+- [ ] Record which demo-material path was used (real 2.0.0-alpha exposure
+      vs synthetic fixture) and why
+- [ ] Write `generateFix(symbolInfo, usageMatch, changeContext)` that takes
+      one affected symbol's info (name + reason from Day 3), one specific
+      usage match (file/line/code from Day 4), and the broader change
+      context, then prompts an LLM to draft a suggested code fix
+- [ ] Define the fix output schema: { file, line, originalCode,
+      suggestedCode, explanation, confidence }
+- [ ] Handle cases where the LLM can't confidently suggest a fix — return
+      confidence: "low" or "requires-manual-review" with an explanation
+      rather than forcing a guess
+- [ ] Generate a fix suggestion for EVERY usage match found, looping over
+      Day 4's output
+- [ ] Assemble all fix suggestions into a single readable Markdown report,
+      grouped by symbol, showing original code, suggested fix, and reasoning
+- [ ] Wire into index.ts: add a `--suggest-fixes` flag that runs after
+      `--scan` and saves the report
 
 ### Day 6 — GitHub Output
 Status: NOT STARTED

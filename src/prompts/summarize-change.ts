@@ -61,6 +61,14 @@ Heuristics:
 Return ONLY a JSON object that matches this exact schema — no prose, no
 markdown, no code fences, no commentary before or after:
 
+IMPORTANT on 'affectedMethods[].name': this must be a real TypeScript-style
+identifier (letters, digits, underscore, dollar sign — start with a letter,
+underscore, or dollar). Do NOT put sentences, phrases like "all exported
+symbols", or counts like "170 removed symbols" in this field. If a removal
+spans many symbols, pick the highest-impact few (under 20) and put the count
+in the 'summary' instead. Invalid names will be silently dropped downstream
+and the user gets a worse report.
+
 {
   "breaking": (boolean),
   "confidence": ("high" or "medium" or "low"),

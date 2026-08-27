@@ -63,6 +63,7 @@ const NOISE_DIRS = [
   '.turbo',
   '.cache',
   'out',
+  '.output',
 ];
 
 /** File extensions ripgrep should consider when scanning codebases. */

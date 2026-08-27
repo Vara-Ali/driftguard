@@ -2,6 +2,15 @@ import axios from 'axios';
 
 import { gatherChangeData, type ChangeData } from './gather-changes';
 import { buildPrompt } from './prompts/summarize-change';
+import { callOnce, DEFAULT_MODEL as INTERNAL_DEFAULT_MODEL, type RawCallResult } from './llm-client-internal';
+
+// Re-export the internal default so Day 3 callers can keep importing from llm-client.
+export const DEFAULT_MODEL = INTERNAL_DEFAULT_MODEL;
+
+// Internal `callOnce` is also re-exported here as a convenience so callers
+// can reach it without importing the `-internal` file directly. Outside
+// `src/` should not see this.
+export { callOnce, type RawCallResult } from './llm-client-internal';
 
 /**
  * LLM client for the breaking-change summarizer.
@@ -63,16 +72,6 @@ export class MissingApiKeyError extends Error {
   }
 }
 
-const API_URL = 'https://api.minimax.io/v1/chat/completions';
-
-/** Default model — matches what Recepta uses in production. */
-export const DEFAULT_MODEL = 'MiniMax-M2.7-highspeed';
-
-/** Temperature zero: we want a verdict, not a creative take. */
-const TEMPERATURE = 0;
-
-const REQUEST_TIMEOUT_MS = 60_000;
-
 /** Strict schema check. Better to fail loudly than to ship a wrong verdict. */
 export function isVerdict(value: unknown): value is Verdict {
   if (typeof value !== 'object' || value === null) return false;
@@ -94,25 +93,31 @@ export function isVerdict(value: unknown): value is Verdict {
 }
 
 /**
- * Models sometimes wrap JSON in ```json fences or prefix it with prose. Strip
- * the common noise before running the JSON parse. Falls back to throwing if
- * nothing JSON-shaped can be recovered.
+ * Models sometimes wrap JSON in ```json fences or prefix it with prose,
+ * and `MiniMax-M2.7-highspeed` can lead with a `<think>...</think>`
+ * reasoning block. Strip the common noise before running the JSON parse.
+ * Falls back to throwing if nothing JSON-shaped can be recovered.
  */
 function extractJson(text: string): unknown {
-  const trimmed = text.trim();
+  let trimmed = text.trim();
 
-  // Fast path: already raw JSON.
+  const thinkOpen = trimmed.indexOf('<think>');
+  if (thinkOpen !== -1) {
+    const thinkClose = trimmed.indexOf('</think>', thinkOpen);
+    if (thinkClose !== -1) {
+      trimmed = (trimmed.slice(0, thinkOpen) + trimmed.slice(thinkClose + 8)).trim();
+    }
+  }
+
   if (trimmed.startsWith('{') && trimmed.endsWith('}')) {
     return JSON.parse(trimmed);
   }
 
-  // Fenced ```json ... ``` block.
   const fenced = trimmed.match(/```(?:json)?\s*([\s\S]*?)```/);
   if (fenced) {
     return JSON.parse(fenced[1].trim());
   }
 
-  // First {...} span in the response.
   const first = trimmed.indexOf('{');
   const last = trimmed.lastIndexOf('}');
   if (first !== -1 && last > first) {
@@ -120,76 +125,6 @@ function extractJson(text: string): unknown {
   }
 
   throw new Error('No JSON object found in response.');
-}
-
-interface ChatCompletionResponse {
-  choices?: { message?: { content?: string } }[];
-  usage?: {
-    prompt_tokens?: number;
-    completion_tokens?: number;
-    total_tokens?: number;
-  };
-}
-
-interface CallOptions {
-  model: string;
-  apiKey: string;
-  system: string;
-  user: string;
-  /** When true, the system message tells the model to fix a previous non-JSON reply. */
-  retryForJson: boolean;
-}
-
-interface RawCallResult {
-  text: string;
-  tokens: number;
-  latencyMs: number;
-}
-
-/**
- * Issue one chat completion. Network errors and non-2xx responses raise.
- * The verdict parsing is the caller's responsibility.
- */
-async function callOnce(options: CallOptions): Promise<RawCallResult> {
-  const messages: { role: 'system' | 'user'; content: string }[] = [
-    { role: 'system', content: options.system },
-    { role: 'user', content: options.user },
-  ];
-
-  if (options.retryForJson) {
-    // Append the explicit retry nudge — system instructions are otherwise the
-    // same, so the model knows the context but is being told the shape failed.
-    messages.push({
-      role: 'user',
-      content:
-        'Your previous response was not parseable JSON. Return ONLY the JSON object — ' +
-        'no prose, no markdown, no code fences. The object must start with "{" and end ' +
-        'with "}" and contain every required field from the schema.',
-    });
-  }
-
-  const start = Date.now();
-
-  const response = await axios.post<ChatCompletionResponse>(
-    API_URL,
-    {
-      model: options.model,
-      messages,
-      temperature: TEMPERATURE,
-    },
-    {
-      timeout: REQUEST_TIMEOUT_MS,
-      headers: {
-        Authorization: `Bearer ${options.apiKey}`,
-        'Content-Type': 'application/json',
-      },
-    },
-  );
-
-  const text = response.data.choices?.[0]?.message?.content ?? '';
-  const tokens = response.data.usage?.total_tokens ?? 0;
-
-  return { text, tokens, latencyMs: Date.now() - start };
 }
 
 /**

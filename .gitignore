@@ -1,5 +1,5 @@
-node_modules/
-dist/
+node_modules
+dist
 
 # Real secrets — never commit. .env.example is the checked-in template.
 .env
@@ -11,6 +11,14 @@ npm-debug.log*
 # Day 5 generated fix reports. The most recent one is what you want to read,
 # not whatever happened to be checked in.
 reports/
+
+# Phase 1 — append-only run history written by apps/api/src/server.ts.
+data/
+
+# Phase 1 — Next.js dashboard scaffolding under apps/web/.
+apps/web/node_modules/
+apps/web/.next/
+apps/web/out/
 
 .DS_Store
 Thumbs.db

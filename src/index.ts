@@ -4,12 +4,9 @@ import { TRACKED_DEPENDENCIES, getTrackedDependency } from './config';
 import { getLatestVersion, RegistryError } from './registry';
 import { compareVersions, VersionCompareError } from './compare';
 import { checkGitHubAuth, reportGitHubAuth } from './github-check';
-import { gatherChangeData, formatChangeData } from './gather-changes';
-import { summarizeChange, MissingApiKeyError, type VerdictResult } from './llm-client';
-import { findUsages, formatScanResult } from './scanner';
-import { draftFixesForChange } from './fix-generator';
-import { saveReport, announceReport } from './report';
-import { runOpenPr } from './git-actions';
+import { formatChangeData, formatScanResult, MissingApiKeyError, type VerdictResult } from './engine';
+import { runFullCheck, type RunFullCheckResult } from './run-full-check';
+import { appendRun } from './run-history';
 
 /**
  * DriftGuard entry point.
@@ -142,7 +139,12 @@ function reportVerdict(result: VerdictResult): void {
   console.log(`  (latency ${result.latencyMs}ms, ${result.totalTokens} tokens, model ${result.model}${result.retried ? ', retried' : ''})`);
 }
 
-/** Fetch and print the change evidence for one upgrade. */
+/**
+ * Phase 1: the CLI is now a thin wrapper around `runFullCheck`. It prints
+ * the structured result and (when appropriate) opens a draft PR. This
+ * keeps the CLI surface identical to Days 6–7 while letting the new
+ * Express server in `apps/api/` call the same orchestrator.
+ */
 async function reportChanges(
   packageName: string,
   oldVersion: string,
@@ -160,8 +162,29 @@ async function reportChanges(
   console.log('');
   console.log(`Gathering change data for ${packageName} ${oldVersion} → ${newVersion} ...`);
 
-  const data = await gatherChangeData(packageName, oldVersion, newVersion);
-  console.log(formatChangeData(data, { maxDiffLines: fullDiff ? 0 : 60 }));
+  // Run the full pipeline once. The orchestrator records every stage's
+  // outcome into a structured result; we print from it below.
+  const target = scanPath
+    ?? process.env.RECEPTA_TARGET_PATH
+    ?? '/mnt/c/Users/Vara/projects/business-brain/cohort-1-squad-siachen';
+
+  const result: RunFullCheckResult = await runFullCheck({
+    packageName,
+    fromVersion: oldVersion,
+    toVersion: newVersion,
+    targetRepoPath: scan ? target : '',
+    prOptions:
+      openPr && summarize && suggestFixes
+        ? {
+            owner: prOwner ?? process.env.GITHUB_REPO_OWNER ?? 'Vara-Ali',
+            repo: prRepo ?? process.env.GITHUB_REPO_NAME ?? 'driftguard',
+            baseBranch: prBaseBranch ?? process.env.GITHUB_REPO_BASE ?? 'main',
+          }
+        : undefined,
+  });
+
+  // Always print the raw change evidence.
+  console.log(formatChangeData(result.changeData, { maxDiffLines: fullDiff ? 0 : 60 }));
 
   if (summarize) {
     if (!process.env.MINIMAX_API_KEY) {
@@ -169,105 +192,59 @@ async function reportChanges(
       console.log('Skipping LLM summary — MINIMAX_API_KEY is not set.');
       return;
     }
-
     console.log('');
     console.log('Asking LLM for a structured verdict ...');
-    let verdict: VerdictResult | undefined;
-    try {
-      const result = await summarizeChange(packageName, oldVersion, newVersion);
-      verdict = result.verdict;
-      reportVerdict(verdict);
-    } catch (error) {
-      if (error instanceof MissingApiKeyError) {
-        console.log(`Skipping LLM summary — ${error.message}`);
-        return;
-      }
-      console.log(`LLM summary failed unexpectedly: ${(error as Error).message}`);
-      return;
-    }
+    reportVerdict(result.verdict);
+  }
 
-    // Day 4: only scan when the verdict is unambiguously breaking. If the LLM
-    // says "safe" or returned a failure result, scanning the codebase for
-    // "removed" symbols would just produce noise.
-    if (scan && verdict && verdict.ok && verdict.verdict.breaking) {
-      const target = scanPath
-        ?? process.env.RECEPTA_TARGET_PATH
-        ?? '/mnt/c/Users/Vara/projects/business-brain/cohort-1-squad-siachen';
+  if (scan && result.scan) {
+    console.log('');
+    console.log(`Verdict says breaking — scanning ${result.scan.targetPath} for usages of affected symbols ...`);
+    console.log(formatScanResult(result.scan));
+  }
 
+  if (suggestFixes && result.draft) {
+    console.log('');
+    console.log('FIX DRAFT COMPLETE');
+    console.log('------------------');
+    const t = result.draft.totals;
+    console.log(`  symbols with matches : ${t.symbolsWithMatches}`);
+    console.log(`  suggestions generated : ${t.suggestions}`);
+    console.log(`  high / medium / low   : ${t.highConfidence} / ${t.mediumConfidence} / ${t.lowConfidence}`);
+    console.log(`  requires manual review: ${t.manualReview}`);
+    console.log(`  generation errors     : ${t.errors}`);
+    console.log(`  report saved to       : ${result.reportPath}`);
+    console.log('');
+    console.log('Read the report, decide which fixes to apply, and skip the manual-review ones.');
+  }
+
+  if (openPr) {
+    if (!result.pr) {
+      // Orchestrator decided not to attempt PR (e.g. zero HIGH fixes, or prOptions absent).
       console.log('');
-      console.log(`Verdict says breaking — scanning ${target} for usages of affected symbols ...`);
-      try {
-        const scanResult = await findUsages(verdict.verdict.affectedMethods, target);
-        console.log(formatScanResult(scanResult));
-      } catch (error) {
-        console.log(`Scan failed: ${(error as Error).message}`);
-      }
-
-      // Day 5: chain the per-match fix drafter when --suggest-fixes is set.
-      if (suggestFixes) {
-        console.log('');
-        console.log('Generating per-usage fix suggestions ...');
-        try {
-          const draft = await draftFixesForChange(packageName, oldVersion, newVersion, target);
-          const savedPath = saveReport(draft);
-          for (const line of announceReport(draft, savedPath)) {
-            console.log(line);
-          }
-
-          // Day 6: chain the GitHub PR creation when --open-pr is set.
-          // Gated to require at least one HIGH-confidence fix so we never
-          // open an empty PR by accident.
-          if (openPr) {
-            if (draft.totals.highConfidence === 0) {
-              console.log('');
-              console.log('Skipping --open-pr: zero HIGH-confidence fixes would be applied.');
-              console.log('  (MEDIUM / LOW / manual-review suggestions go into a PR as a checklist,');
-              console.log('   not as auto-applied diffs. Run without --open-pr to just see the report.)');
-            } else {
-              console.log('');
-              console.log('Opening draft PR on GitHub ...');
-              console.log(`  → creating branch on ${prRepo ?? process.env.GITHUB_REPO_NAME ?? 'driftguard'} ...`);
-              try {
-                const result = await runOpenPr({
-                  draft,
-                  repo: {
-                    owner: prOwner ?? process.env.GITHUB_REPO_OWNER ?? 'Vara-Ali',
-                    name: prRepo ?? process.env.GITHUB_REPO_NAME ?? 'driftguard',
-                  },
-                  baseBranch: prBaseBranch ?? process.env.GITHUB_REPO_BASE ?? 'main',
-                  targetRepoPath: target,
-                });
-
-                if (result.ok) {
-                  console.log('  → PR opened.');
-                  console.log('');
-                  console.log('DRAFT PR OPENED');
-                  console.log('---------------');
-                  console.log(`  applied : ${result.applied} HIGH-confidence fix(es)`);
-                  console.log(`  skipped : ${result.skipped}`);
-                  console.log(`  url     : ${result.prUrl}`);
-                } else {
-                  console.log('');
-                  console.log(`Draft PR failed: ${result.error}`);
-                  console.log('  → Branch may have been created. Inspect the repo before retrying.');
-                }
-              } catch (error) {
-                console.log(`Draft PR threw unexpectedly: ${(error as Error).message}`);
-                if ((error as Error).stack) {
-                  console.log((error as Error).stack);
-                }
-              }
-            }
-          }
-        } catch (error) {
-          if (error instanceof MissingApiKeyError) {
-            console.log(`Skipping fix draft — ${error.message}`);
-          } else {
-            console.log(`Fix draft failed: ${(error as Error).message}`);
-          }
-        }
-      }
+      console.log('Skipping --open-pr: no PR was attempted for this run.');
+    } else if (result.pr.ok) {
+      console.log('');
+      console.log('DRAFT PR OPENED');
+      console.log('---------------');
+      console.log(`  applied : ${result.pr.applied} HIGH-confidence fix(es)`);
+      console.log(`  skipped : ${result.pr.skipped}`);
+      console.log(`  url     : ${result.pr.prUrl}`);
+    } else {
+      console.log('');
+      console.log(`Draft PR failed: ${result.pr.error}`);
+      console.log('  → Branch may have been created. Inspect the repo before retrying.');
     }
+  }
+
+  // Persist the run into history so the dashboard sees it. Best-effort —
+  // a history write failure should not break the CLI's exit code.
+  try {
+    await appendRun(result);
+    console.log('');
+    console.log(`Run appended to run history (runId: ${result.runId}).`);
+  } catch (e) {
+    console.log(`Could not write run history: ${(e as Error).message}`);
   }
 }
 

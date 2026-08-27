@@ -12,16 +12,27 @@ import cors from 'cors';
 
 import { runFullCheck, type RunFullCheckArgs, type RunFullCheckPrOptions } from 'src/run-full-check';
 import { appendRun, listRuns, getRun, computeMetrics, type RunHistoryEntry } from 'src/run-history';
+import { setInstallationOctokitFactory } from 'src/octokit-client';
+import { getInstallationOctokit } from './github-app';
+import { registerShutdownHandlers } from './db';
+import githubRouter from './routes/github';
+import testInstallationRouter from './routes/test-installation';
 
 /**
- * Phase 1 — internal HTTP API for the DriftGuard engine.
+ * DriftGuard internal HTTP API.
  *
- * Endpoints:
+ * Phase 1 endpoints:
  *   GET  /api/health         → { ok: true }
  *   GET  /api/runs           → RunHistoryEntry[] (newest first)
  *   GET  /api/runs/:id       → RunHistoryEntry | 404
  *   GET  /api/metrics        → DashboardMetrics
  *   POST /api/checks         → RunFullCheckResult (and appends to history)
+ *
+ * Phase 2 endpoints:
+ *   GET  /api/github/install                       → 302 to GitHub
+ *   GET  /api/github/callback                      → 302 to /repositories
+ *   GET  /api/installations                        → Installation[]
+ *   GET  /api/github/test-installation/:id         → token-minter smoke test
  *
  * The server is intentionally synchronous per request — long-running LLM
  * fix-draft stages can take minutes, and Express's default request timeout
@@ -82,6 +93,7 @@ interface CheckRequestBody {
   toVersion?: unknown;
   targetRepoPath?: unknown;
   prOptions?: unknown;
+  installationId?: unknown;
 }
 
 function isString(v: unknown): v is string {
@@ -95,6 +107,16 @@ function parsePrOptions(raw: unknown): RunFullCheckPrOptions | undefined {
     return undefined;
   }
   return { owner: r.owner, repo: r.repo, baseBranch: r.baseBranch };
+}
+
+function parseInstallationId(raw: unknown): number | undefined {
+  if (raw === undefined || raw === null) return undefined;
+  if (typeof raw === 'number' && Number.isFinite(raw) && raw > 0) return raw;
+  if (typeof raw === 'string' && raw.length > 0) {
+    const n = Number(raw);
+    if (Number.isFinite(n) && n > 0) return n;
+  }
+  return undefined;
 }
 
 app.post('/api/checks', async (req: Request, res: Response) => {
@@ -117,12 +139,14 @@ app.post('/api/checks', async (req: Request, res: Response) => {
     return;
   }
 
+  const installationId = parseInstallationId(body.installationId);
   const args: RunFullCheckArgs = {
     packageName: body.packageName,
     fromVersion: body.fromVersion,
     toVersion: body.toVersion,
     targetRepoPath: body.targetRepoPath,
     prOptions: parsePrOptions(body.prOptions),
+    ...(installationId !== undefined ? { installationId } : {}),
   };
 
   try {
@@ -139,7 +163,25 @@ app.post('/api/checks', async (req: Request, res: Response) => {
   }
 });
 
+// Phase 2 — GitHub App install flow + dashboard data endpoints.
+app.use(githubRouter);
+app.use(testInstallationRouter);
+
+// Phase 2 — wire the installation-Octokit factory so the engine can mint
+// short-lived installation tokens instead of falling back to GITHUB_TOKEN.
+setInstallationOctokitFactory(async (installationId: number) => {
+  return getInstallationOctokit(installationId);
+});
+
+registerShutdownHandlers();
+
 app.listen(PORT, () => {
   console.log(`driftguard-api listening on http://localhost:${PORT}`);
   console.log(`CORS origin: ${WEB_ORIGIN}`);
+  if (!process.env.SUPABASE_DB_URL) {
+    console.warn(`SUPABASE_DB_URL is not set — /api/installations will 500.`);
+  }
+  if (!process.env.GITHUB_APP_ID) {
+    console.warn(`GITHUB_APP_ID is not set — /api/github/install will 500.`);
+  }
 });

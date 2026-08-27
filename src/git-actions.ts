@@ -6,7 +6,7 @@ import { execFileSync } from 'child_process';
 // ESM-only package from a CommonJS file. Type-only, erased at runtime.
 import type { Octokit as OctokitType } from '@octokit/rest' with { 'resolution-mode': 'import' };
 
-import { hasGitHubToken, getOctokit, MissingTokenError } from './octokit-client';
+import { hasGitHubToken, getOctokit, getOctokitForInstallation, hasInstallationOctokitFactory, MissingTokenError } from './octokit-client';
 import type { FixDraft, FixSuggestion } from './fix-generator';
 
 /**
@@ -107,6 +107,38 @@ export function buildPrTitle(draft: FixDraft, primarySymbol: string): string {
 }
 
 /**
+ * Resolve the Octokit client to use for an operation. If `installationId` is
+ * supplied AND the installation-auth helper is reachable, use it (Phase 2
+ * GitHub App path). Otherwise fall back to the PAT path. The CLI uses PAT;
+ * the API server uses the installation path when an installation id is
+ * supplied by the dashboard.
+ */
+async function resolveOctokit(installationId?: number): Promise<
+  { ok: true; octokit: OctokitType } | { ok: false; error: string }
+> {
+  if (installationId !== undefined) {
+    if (!hasInstallationOctokitFactory()) {
+      return {
+        ok: false,
+        error: `installationId=${installationId} was supplied, but no installation-Octokit factory is registered. The API server registers one on boot — this process is probably the CLI, which doesn't support installation auth.`,
+      };
+    }
+    const octokit = await getOctokitForInstallation(installationId);
+    return { ok: true, octokit };
+  }
+
+  if (!hasGitHubToken()) {
+    return { ok: false, error: new MissingTokenError().message };
+  }
+  try {
+    const octokit = await getOctokit();
+    return { ok: true, octokit };
+  } catch (error) {
+    return { ok: false, error: `Failed to initialize Octokit: ${(error as Error).message}` };
+  }
+}
+
+/**
  * Create a new branch from the base branch HEAD. Returns the new branch
  * name and base SHA so the caller can attach a commit to it.
  *
@@ -116,17 +148,11 @@ export async function createFixBranch(
   repo: RepoRef,
   baseBranch: string,
   branchName: string,
+  installationId?: number,
 ): Promise<BranchResult> {
-  if (!hasGitHubToken()) {
-    return { ok: false, error: new MissingTokenError().message };
-  }
-
-  let octokit: OctokitType;
-  try {
-    octokit = await getOctokit();
-  } catch (error) {
-    return { ok: false, error: `Failed to initialize Octokit: ${(error as Error).message}` };
-  }
+  const resolved = await resolveOctokit(installationId);
+  if (!resolved.ok) return { ok: false, error: resolved.error };
+  const octokit = resolved.octokit;
 
   let baseSha: string;
   try {
@@ -441,17 +467,11 @@ export async function openDraftPR(
   headBranch: string,
   title: string,
   body: string,
+  installationId?: number,
 ): Promise<OpenPrResult> {
-  if (!hasGitHubToken()) {
-    return { ok: false, error: new MissingTokenError().message };
-  }
-
-  let octokit: OctokitType;
-  try {
-    octokit = await getOctokit();
-  } catch (error) {
-    return { ok: false, error: `Failed to initialize Octokit: ${(error as Error).message}` };
-  }
+  const resolved = await resolveOctokit(installationId);
+  if (!resolved.ok) return { ok: false, error: resolved.error };
+  const octokit = resolved.octokit;
 
   try {
     const response = await octokit.rest.pulls.create({
@@ -518,8 +538,10 @@ export async function runOpenPr(args: {
   repo: RepoRef;
   baseBranch: string;
   targetRepoPath: string;
+  /** When provided, use the GitHub App installation token instead of PAT. */
+  installationId?: number;
 }): Promise<OpenPrOrchestratorResult> {
-  const { draft, repo, baseBranch, targetRepoPath } = args;
+  const { draft, repo, baseBranch, targetRepoPath, installationId } = args;
 
   // 1. Identify the primary symbol for the PR title.
   const highSuggestions = draft.suggestions.filter((s) => s.confidence === 'high');
@@ -531,7 +553,7 @@ export async function runOpenPr(args: {
   const branchName = buildBranchName(draft.packageName);
 
   // 2. Create the branch on GitHub first.
-  const branchResult = await createFixBranch(repo, baseBranch, branchName);
+  const branchResult = await createFixBranch(repo, baseBranch, branchName, installationId);
   if (!branchResult.ok) {
     return {
       ok: false,
@@ -580,7 +602,7 @@ export async function runOpenPr(args: {
   // 5. Open the draft PR.
   const title = buildPrTitle(draft, primarySymbol);
   const body = renderPrBody(draft, branchName);
-  const prResult = await openDraftPR(repo, baseBranch, branchName, title, body);
+  const prResult = await openDraftPR(repo, baseBranch, branchName, title, body, installationId);
   if (!prResult.ok) {
     return {
       ok: false,

@@ -42,6 +42,8 @@ export interface RunFullCheckArgs {
   targetRepoPath: string;
   /** When provided, the pipeline will draft fixes and open a draft PR against this repo. */
   prOptions?: RunFullCheckPrOptions;
+  /** Phase 2: when provided, use the GitHub App installation token for PR creation. */
+  installationId?: number;
   /** Optional model override; defaults to whatever the engine picks. */
   model?: string;
 }
@@ -94,7 +96,7 @@ function hasApiKey(): boolean {
 export async function runFullCheck(args: RunFullCheckArgs): Promise<RunFullCheckResult> {
   const runId = randomUUID();
   const startedAt = new Date();
-  const { packageName, fromVersion, toVersion, targetRepoPath, prOptions, model } = args;
+  const { packageName, fromVersion, toVersion, targetRepoPath, prOptions, installationId, model } = args;
 
   // Initialize empty result so partial failures still produce something to log.
   let changeData: ChangeData = {
@@ -200,6 +202,7 @@ export async function runFullCheck(args: RunFullCheckArgs): Promise<RunFullCheck
         repo,
         baseBranch: prOptions.baseBranch,
         targetRepoPath,
+        ...(installationId !== undefined ? { installationId } : {}),
       });
       if (!pr.ok) {
         // PR failure is a partial failure — the run still happened.

@@ -1,8 +1,8 @@
 {
   "name": "driftguard-api",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
-  "description": "Phase 1 — internal HTTP API for DriftGuard. Boots Express, imports the engine from ../../src, exposes POST /api/checks and GET /api/runs.",
+  "description": "DriftGuard HTTP API. Phase 1 (Express + read endpoints + POST /api/checks) + Phase 2 (GitHub App install flow + Supabase-backed /api/installations).",
   "scripts": {
     "dev": "node -r tsconfig-paths/register -r ts-node/register src/server.ts",
     "build": "tsc",
@@ -10,13 +10,17 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
+    "@octokit/auth-app": "^7.1.4",
+    "@octokit/rest": "^22.0.1",
     "cors": "^2.8.5",
-    "express": "^4.21.0"
+    "express": "^4.21.0",
+    "pg": "^8.13.1"
   },
   "devDependencies": {
     "@types/cors": "^2.8.17",
     "@types/express": "^4.17.21",
     "@types/node": "^20.19.0",
+    "@types/pg": "^8.11.10",
     "ts-node": "^10.9.2",
     "tsconfig-paths": "^4.2.0",
     "typescript": "^5.9.3"

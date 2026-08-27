@@ -9,6 +9,10 @@ import type { Octokit as OctokitType } from '@octokit/rest' with { 'resolution-m
  * `ts-node` works), so it has to come in through a dynamic `import()`. That is
  * a runtime cost worth paying once rather than per call site — hence the
  * cached promise here instead of each module importing it for itself.
+ *
+ * Phase 2 left the PAT path intact. The API server supplies its own
+ * installation-Octokit via `setOctokitFactory` so the engine doesn't need
+ * to know where the GitHub App credentials live.
  */
 
 let clientPromise: Promise<OctokitType> | null = null;
@@ -28,7 +32,7 @@ export function hasGitHubToken(): boolean {
 }
 
 /**
- * Get the shared authenticated Octokit client.
+ * Get the shared authenticated Octokit client (PAT path).
  *
  * Throws MissingTokenError when no token is configured — callers that can
  * degrade gracefully should check `hasGitHubToken()` first.
@@ -45,4 +49,37 @@ export function getOctokit(): Promise<OctokitType> {
   }
 
   return clientPromise;
+}
+
+/* ──────────────────────────────────────────────────────────────────────────
+ * Phase 2 — installation-Octokit injection point.
+ *
+ * The API server sets a factory that maps an installation id → Octokit.
+ * The engine reads the factory when `installationId` is supplied to
+ * `runOpenPr`. CLI users don't set a factory, so installation-id requests
+ * from the CLI fail fast with a clear message.
+ * ──────────────────────────────────────────────────────────────────────── */
+
+export type InstallationOctokitFactory = (installationId: number) => Promise<OctokitType>;
+
+let installationOctokitFactory: InstallationOctokitFactory | null = null;
+
+/** Phase 2: API server sets this on boot. CLI does not. */
+export function setInstallationOctokitFactory(factory: InstallationOctokitFactory | null): void {
+  installationOctokitFactory = factory;
+}
+
+export function hasInstallationOctokitFactory(): boolean {
+  return installationOctokitFactory !== null;
+}
+
+export async function getOctokitForInstallation(installationId: number): Promise<OctokitType> {
+  if (!installationOctokitFactory) {
+    throw new Error(
+      `installationId=${installationId} was supplied, but no installation-Octokit factory ` +
+        `is registered. The CLI does not support installation auth — call from the ` +
+        `API server (apps/api/src/server.ts), which wires the factory on boot.`,
+    );
+  }
+  return installationOctokitFactory(installationId);
 }

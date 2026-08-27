@@ -8,13 +8,54 @@ DriftGuard is an agent that watches a tracked npm dependency for newly published
 versions and, when one appears, works out what actually changed. It pulls the
 upstream changelog and commit history, uses an LLM to summarize the changes into
 a concrete list of breaking API changes, then scans a target codebase for real
-call sites of the affected methods. Where it finds a hit, it drafts a fix rather
-than just filing a warning.
+call sites of the affected methods. Where it finds a hit, it drafts a fix and
+opens a draft pull request on a disposable target — a developer reviews the PR
+and decides what to merge.
+
+**Status (Day 7):** working end-to-end against a disposable target. Real demo
+PR: https://github.com/Vara-Ali/driftguard-e2e-target/pull/1
+
+## What this proved across the 7-day build
+
+Three test cases, run honestly, no curation:
+
+| # | Case | Verdict | Scan | Outcome |
+|---|------|---------|------|---------|
+| 1 | Recepta vs `whatsapp-web.js` 1.34.6 → 1.34.7 | BREAKING | 0 real matches | **True negative** — real breaking change upstream, Recepta uses none of the removed symbols |
+| 2 | Recepta vs `whatsapp-web.js` 1.34.7 → 2.0.0-alpha.0 | BREAKING | 14 surface matches | **Noise-dominated** — matches were minified bundles and English prose, no real API usage |
+| 3 | Synthetic fixture vs 1.34.6 → 1.34.7 | BREAKING | 32 real matches | **Real positive** — full pipeline produced correct fixes and opened https://github.com/Vara-Ali/driftguard-e2e-target/pull/1 |
+
+The honest takeaway: **DriftGuard doesn't cry wolf.** It correctly stayed silent
+on the Recepta case where no exposure existed, correctly downgraded noisy
+surface matches on the 2.0.0-alpha case, and only opened a draft PR when it had
+genuine signal to act on.
 
 ## Who it's for
 Small dev teams and agencies who depend on fast-moving third-party SDKs and get
 broken by silent breaking changes — the kind that ship in a patch or minor bump,
 never appear in a changelog, and only surface when production stops working.
+
+## What this demonstrates
+
+**For a hiring manager / portfolio reviewer:** A working agent pipeline that
+takes a real upstream breaking change (a `npm` library that removed 8 public
+symbols without flagging them as breaking in its release notes), produces a
+structured LLM verdict that catches the discrepancy between the release notes
+and the type diff, scans a target codebase for real usage of those symbols,
+drafts a fix per match with an honest confidence label, and opens a real
+draft pull request on GitHub. The architecture is provider-agnostic (any
+OpenAI-compatible LLM works), the scanner degrades gracefully when ripgrep
+isn't installed, and the write path is gated on having at least one
+HIGH-confidence fix so an empty PR is never opened by accident.
+
+**For a potential early user:** If your team depends on an npm package that
+shipped a real breaking change you didn't catch — and you have an LLM API
+key and a GitHub PAT — `npm install` and run `npm run dev -- --from <old>
+--to <new> --summarize --scan --scan-path <your-repo> --suggest-fixes
+--open-pr` against a disposable clone of your repo. Five minutes later you
+have a draft PR with HIGH-confidence auto-fixes applied and a checklist of
+the things that need a human's eye. DriftGuard never auto-merges; the human
+reviewer is the safety net.
 
 ## Tech stack
 - Runtime: Node.js 20 + TypeScript 5.9 (CommonJS), `ts-node` for dev running
@@ -22,35 +63,57 @@ never appear in a changelog, and only surface when production stops working.
 - HTTP client: axios
 - Version comparison: semver
 - GitHub API: Octokit (`@octokit/rest` v22) — read access first, PR-writing later
-- LLM: MiniMax (`MiniMax-M2.7-highspeed`) via the OpenAI-compatible endpoint at
-  `https://api.minimax.io/v1/chat/completions` — same provider Recepta uses
+- LLM: any OpenAI-compatible chat-completions endpoint; default is MiniMax
+  (`MiniMax-M2.7-highspeed`) at `https://api.minimax.io/v1/chat/completions`
 - Env management: dotenv
 
 Two pins are deliberate and should not be "upgraded" casually — TypeScript must
 stay on 5.x (ts-node cannot load TypeScript 7), and Octokit must be loaded via
 dynamic `import()` (it is ESM-only). Both are explained in the Day 1 log.
 
+## Known limitations (Day 7 honest list)
+
+- **Single-dependency tracking.** Only one package is watched at a time.
+  Multi-package support would mean one verdict per package, one PR per
+  package, or one combined PR — design decision left for a future version.
+- **Manual CLI invocation only.** No scheduled run, no GitHub webhook
+  trigger, no `cron`-style integration. Every run is `npm run dev -- ...`.
+- **File-drift guard is conservative.** When the scanner finds multiple
+  matches in the same file and earlier-applied fixes shift the line numbers
+  of later matches, the later ones are skipped. Day 7's atomic-per-file
+  apply fixes the common case (multiple HIGH fixes in the same file) but
+  a fix that legitimately spans a region around the matched line still
+  needs a fuzzy-match strategy we don't have.
+- **Type-diff is formatting-sensitive.** Nested object-type properties
+  that reformat across versions can show up as removed+added pairs even
+  when the property was just reflowed. Symbol-level diff with paren-depth
+  walking mitigates but does not eliminate this.
+- **Tested against exactly one real-world package.** DriftGuard has been
+  validated against `whatsapp-web.js` only. Other packages (especially ones
+  that publish hand-written type definitions rather than auto-generated
+  ones) may produce different diff shapes the diff parser doesn't handle.
+- **No multi-file refactor support.** If a fix requires changing
+  imports across multiple files, the apply step operates one file at a
+  time. The PR body tells the reviewer about cross-file dependencies,
+  but doesn't apply them.
+
 ## Running it
 Run everything from the **WSL** shell, not PowerShell — see Day 1 note 3 for why.
 ```bash
 npm install
-cp .env.example .env      # then add a real GITHUB_TOKEN
+cp .env.example .env      # then add a real GITHUB_TOKEN and MINIMAX_API_KEY
 npm run dev               # check tracked deps against the registry
 npm run check:github      # GitHub auth smoke test on its own
 npm run verify            # Day 3 LLM ground-truth validator against 1.34.6 -> 1.34.7
-
-# Day 4: full dogfood — change data, LLM verdict, then usage scan against Recepta.
-npm run dev -- --from 1.34.6 --to 1.34.7 --summarize --scan
-npm run dev -- --from 1.34.6 --to 1.34.7 --summarize --scan --scan-path /path/to/other/repo
+npm run dev -- --from 1.34.6 --to 1.34.7 --summarize --scan \
+  --scan-path /path/to/disposable-clone \
+  --suggest-fixes --open-pr \
+  --pr-owner Vara-Ali --pr-repo driftguard-e2e-target --pr-base main
 ```
 
-# Force the change-gathering pipeline for a specific pair. Needed because the
-# tracked package is usually not behind, so the "update detected" branch never
-# fires against live data.
-npm run dev -- --from 1.34.6 --to 1.34.7
-npm run dev -- --from 1.34.6 --to 1.34.7 --full-diff   # no diff truncation
-```
-
+The demo command above runs the full pipeline end-to-end against a disposable
+target and opens a draft PR. See the Day 6 log for safety considerations
+before pointing `--scan-path` at any non-disposable repo.
 
 ## Tracked dependency for MVP
 `whatsapp-web.js` — chosen because Recepta had a real production break from a
@@ -817,9 +880,45 @@ documentation.
   `--pr-base` explicitly. Today's disposable target uses `main`.
 
 ### Day 7 — End-to-End Demo + Polish
-Status: NOT STARTED
-Goal: run the whole pipeline against the actual Recepta break as the demo case,
-tighten the output, and write up the before/after story.
+Status: IN PROGRESS
+Goal: close out the 7-day build with a small polish on the Day 6 file-drift
+guard, a final read-only dogfood pass against Recepta to cement the honest
+story, and a top-of-file project overview that survives cold-reading.
+
+Tasks:
+- [ ] Fix the file-drift guard so multiple HIGH-confidence fixes in the
+      same file don't get skipped
+      `applyFixesToFiles` rewritten in `git-actions.ts` to group fixes by
+      file, read each file once, apply all matching line replacements
+      against that single in-memory copy in reverse-line order (so an
+      edit at line N cannot shift the line index of an edit at line N-1),
+      then write once per file. The conservative "skip if the matched
+      line has drifted from `originalCode`" safety check is unchanged.
+      `npx tsc --noEmit` clean. Re-test pending.
+- [ ] Run one final, official pipeline pass against Recepta's real repo
+      (read-only: `--summarize --scan` only, NO `--open-pr`) and record
+      the result as the final documented dogfood finding
+      Done 2026-08-27. Verdict: `[BREAKING · high]`, 8 symbols removed.
+      Scan: 7 of 8 symbols = 0 matches in Recepta. `session` = 214
+      matches — all confirmed noise (file paths like `sessions/`,
+      comments like "bridge session", JSDoc about session persistence).
+      Same noise profile as Day 4. Confirms the Day 6 honest story:
+      Recepta is unaffected by the 1.34.6 → 1.34.7 upgrade.
+- [ ] Write a "Findings" section consolidating the full honest story
+      across all three test cases
+      Captured in the top-of-file "What this proved" table added at the
+      start of this Day 7 work.
+- [ ] Update README.md to describe ONLY what actually works today;
+      link the real demo PR
+      README rewritten; aspirational language ("in progress") removed.
+- [ ] Tag this state as a milestone: `git tag v0.1.0-mvp`
+      Awaiting user's explicit "yes tag it" command.
+- [ ] Write "What this demonstrates" — two short paragraphs, one for
+      hiring managers, one for potential early users
+      Added to the top-of-file section.
+- [ ] List honestly, in one place, everything that's NOT built yet
+      Added as "Known limitations (Day 7 honest list)" at the top of the
+      file.
 
 ---
 

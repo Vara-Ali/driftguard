@@ -170,9 +170,15 @@ export async function createFixBranch(
 /**
  * Apply HIGH-confidence fix suggestions to the files on disk.
  *
- * The apply is a literal line-range replace: read the file, find the
- * matched line, replace the original line with the suggested code. Only
- * HIGH confidence is applied — MEDIUM, LOW, and manual-review become
+ * Atomic-per-file: read each target file ONCE, apply ALL of its matching
+ * HIGH-confidence fixes against the in-memory copy in reverse line order
+ * (so a later-applied edit at line N cannot shift the line number of an
+ * earlier-applied edit at line N-1), then write the file ONCE. This is
+ * the Day 7 polish for the file-drift bug Day 6 hit, where per-fix
+ * read/write loops caused later suggestions to fail the `lines[target]
+ * !== originalCode` guard.
+ *
+ * Only HIGH confidence is applied — MEDIUM, LOW, and manual-review become
  * checklist items in the PR body.
  *
  * The `targetRepoPath` is the local checkout of the target repo. We do
@@ -180,59 +186,79 @@ export async function createFixBranch(
  * operates against a separately-cloned consumer repo.
  *
  * Returns the list of files actually written. Suggestions whose original
- * line is no longer present are skipped (counted as `skipped`).
+ * line is no longer present at scan time are skipped (counted as `skipped`)
+ * — the conservative safety check itself is unchanged.
  */
 export function applyFixesToFiles(
   suggestions: FixSuggestion[],
   targetRepoPath: string,
 ): ApplyResult {
-  const filesWritten = new Set<string>();
+  // 1. Filter to HIGH-confidence with a non-null suggestedCode.
+  const applicable = suggestions.filter(
+    (s) => s.confidence === 'high' && s.suggestedCode !== null,
+  );
+
+  // 2. Group by file path. Suggestions within a file keep their original
+  //    order, but we'll apply them in reverse-line order below.
+  const byFile = new Map<string, FixSuggestion[]>();
+  for (const s of applicable) {
+    const list = byFile.get(s.file);
+    if (list) list.push(s);
+    else byFile.set(s.file, [s]);
+  }
+
+  const filesWritten: string[] = [];
   let applied = 0;
   let skipped = 0;
 
-  for (const suggestion of suggestions) {
-    if (suggestion.confidence !== 'high') continue;
-    if (suggestion.suggestedCode === null) {
-      skipped += 1;
-      continue;
-    }
-
-    const abs = path.isAbsolute(suggestion.file)
-      ? suggestion.file
-      : path.join(targetRepoPath, suggestion.file);
+  // 3. For each file: read once, apply all in reverse line order, write once.
+  for (const [filePath, fixes] of byFile.entries()) {
+    const abs = path.isAbsolute(filePath)
+      ? filePath
+      : path.join(targetRepoPath, filePath);
 
     let content: string;
     try {
       content = fs.readFileSync(abs, 'utf8');
-    } catch (error) {
-      skipped += 1;
+    } catch {
+      // File unreadable — every fix for this file is skipped.
+      skipped += fixes.length;
       continue;
     }
 
     const lines = content.split('\n');
-    const target = suggestion.line - 1;
-    if (target < 0 || target >= lines.length) {
-      skipped += 1;
-      continue;
+
+    // Sort by line descending so applying edit at line N does not shift
+    // the index of an edit at line N-1 we haven't applied yet.
+    const sorted = [...fixes].sort((a, b) => b.line - a.line);
+
+    let fileApplied = 0;
+    for (const fix of sorted) {
+      const target = fix.line - 1;
+      if (target < 0 || target >= lines.length) {
+        skipped += 1;
+        continue;
+      }
+      if (lines[target] !== fix.originalCode) {
+        // Conservative safety check: the matched line content has drifted
+        // since the scanner ran. Skip rather than corrupt the file.
+        skipped += 1;
+        continue;
+      }
+      lines[target] = fix.suggestedCode ?? lines[target];
+      fileApplied += 1;
     }
 
-    if (lines[target] !== suggestion.originalCode) {
-      // The file moved on since the suggestion was generated. We could
-      // try fuzzy matching, but for Day 6 the conservative thing is to
-      // skip rather than corrupt the file.
-      skipped += 1;
-      continue;
+    if (fileApplied > 0) {
+      fs.writeFileSync(abs, lines.join('\n'), 'utf8');
+      filesWritten.push(filePath);
+      applied += fileApplied;
     }
-
-    lines[target] = suggestion.suggestedCode;
-    fs.writeFileSync(abs, lines.join('\n'), 'utf8');
-    filesWritten.add(suggestion.file);
-    applied += 1;
   }
 
   return {
     ok: true,
-    filesWritten: Array.from(filesWritten),
+    filesWritten,
     applied,
     skipped,
   };
